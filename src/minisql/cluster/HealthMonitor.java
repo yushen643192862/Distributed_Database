@@ -1,0 +1,56 @@
+package minisql.cluster;
+
+import minisql.cluster.planner.RuntimeCatalog;
+import minisql.cluster.node.NodeRecord;
+
+import java.time.Instant;
+import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+public class HealthMonitor {
+    private final RuntimeCatalog catalog;
+    private final Map<String, NodeRecord> dataNodes;
+    private final ClusterRebalancer rebalancer;
+    private final Runnable stateSaver;
+    private final long timeoutMs;
+    private ScheduledExecutorService scheduler;
+
+    public HealthMonitor(RuntimeCatalog catalog, Map<String, NodeRecord> dataNodes,
+                         ClusterRebalancer rebalancer, Runnable stateSaver, long timeoutMs) {
+        this.catalog = catalog;
+        this.dataNodes = dataNodes;
+        this.rebalancer = rebalancer;
+        this.stateSaver = stateSaver;
+        this.timeoutMs = timeoutMs;
+    }
+
+    public void start() {
+        if (scheduler != null) {
+            return;
+        }
+        scheduler = Executors.newSingleThreadScheduledExecutor();
+        scheduler.scheduleAtFixedRate(this::checkNodes, timeoutMs, timeoutMs, TimeUnit.MILLISECONDS);
+    }
+
+    private void checkNodes() {
+        long now = Instant.now().toEpochMilli();
+        for (NodeRecord node : dataNodes.values()) {
+            if (!node.isAvailable() || node.lastHeartbeatEpochMs() <= 0) {
+                continue;
+            }
+            if (now - node.lastHeartbeatEpochMs() > timeoutMs) {
+                node.markOffline("Heartbeat timeout");
+                rebalancer.rebalance();
+                saveState();
+            }
+        }
+    }
+
+    private void saveState() {
+        if (stateSaver != null) {
+            stateSaver.run();
+        }
+    }
+}

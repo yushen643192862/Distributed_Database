@@ -11,4 +11,4 @@ WORKDIR /app
 ENV MINISQL_DATA=/app/data/minisql-state.bin
 COPY --from=build /app/target/classes ./classes
 
-CMD ["java", "-cp", "classes", "edu.minisql.app.App"]
+CMD ["java", "-cp", "classes", "minisql.app.App"]
