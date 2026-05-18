@@ -1,5 +1,7 @@
 package minisql.cluster.planner;
 
+import minisql.cluster.node.NodeRecord;
+import minisql.cluster.node.ReplicaRole;
 import parser.parser.ColumnDefinition;
 import parser.parser.Constraint;
 import parser.parser.ConstraintType;
@@ -16,6 +18,7 @@ import physical.TableMetadata;
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 
@@ -49,7 +52,12 @@ public class RuntimeCatalog implements Serializable {
         clusterMetadata.addNode(new DataNodeMetadata(nodeId, host, port, alive, databaseType));
     }
 
-    public void registerCreateTable(CreateTableStatement statement, ShardOptions options, Collection<String> nodeIds) {
+    public void removeNode(String nodeId) {
+        clusterMetadata.removeNode(nodeId);
+        routeVersion++;
+    }
+
+    public void registerCreateTable(CreateTableStatement statement, ShardOptions options, Collection<NodeRecord> nodes) {
         parser.semantic.TableSchema semanticTable = new parser.semantic.TableSchema(statement.tableName);
         for (ColumnDefinition column : statement.columns) {
             semanticTable.addColumn(column.columnName, renderType(column), isNotNull(column));
@@ -59,20 +67,18 @@ public class RuntimeCatalog implements Serializable {
         }
         schemaCatalog.addTable(semanticTable);
 
-        List<String> nodes = new ArrayList<>(nodeIds);
-        if (nodes.isEmpty()) {
-            throw new IllegalArgumentException("No DataNode available");
-        }
-        if (options.replicaCount() > nodes.size()) {
-            throw new IllegalArgumentException("Replica count cannot exceed DataNode count");
+        List<NodeRecord> primaryNodes = primaryNodes(nodes);
+        if (primaryNodes.isEmpty()) {
+            throw new IllegalArgumentException("No primary DataNode available");
         }
 
         TableMetadata table = new TableMetadata(statement.tableName, options.shardKey());
         for (int shardIndex = 0; shardIndex < options.shardCount(); shardIndex++) {
-            String primary = nodes.get(shardIndex % nodes.size());
+            NodeRecord primaryNode = primaryNodes.get(shardIndex % primaryNodes.size());
+            String primary = primaryNode.nodeId();
             List<String> replicas = new ArrayList<>();
-            for (int i = 1; i < options.replicaCount(); i++) {
-                replicas.add(nodes.get((shardIndex + i) % nodes.size()));
+            if (primaryNode.partnerNodeId() != null) {
+                replicas.add(primaryNode.partnerNodeId());
             }
             table.addShard(new ShardMetadata(
                     statement.tableName + "_" + shardIndex,
@@ -83,6 +89,33 @@ public class RuntimeCatalog implements Serializable {
         }
         clusterMetadata.addTable(table);
         routeVersion++;
+    }
+
+    public List<String> rebalancePrimaryReplicaShards(Collection<NodeRecord> nodes) {
+        List<NodeRecord> primaryNodes = primaryNodes(nodes);
+        List<String> changes = new ArrayList<>();
+        if (primaryNodes.isEmpty()) {
+            return changes;
+        }
+        for (TableMetadata table : clusterMetadata.getTables()) {
+            for (ShardMetadata shard : new ArrayList<>(table.getShards())) {
+                NodeRecord primaryNode = primaryNodes.get(shard.getShardIndex() % primaryNodes.size());
+                String desiredPrimary = primaryNode.nodeId();
+                List<String> desiredReplicas = new ArrayList<>();
+                if (primaryNode.partnerNodeId() != null) {
+                    desiredReplicas.add(primaryNode.partnerNodeId());
+                }
+                if (shard.getPrimaryNodeId().equalsIgnoreCase(desiredPrimary)
+                        && sameNodeIds(shard.getReplicaNodeIds(), desiredReplicas)) {
+                    continue;
+                }
+                table.replaceShard(new ShardMetadata(shard.getShardName(), shard.getTableName(),
+                        shard.getShardIndex(), desiredPrimary, desiredReplicas));
+                changes.add(shard.getShardName() + " -> primary=" + desiredPrimary + ", replicas=" + desiredReplicas);
+                routeVersion++;
+            }
+        }
+        return changes;
     }
 
     public void dropTable(String tableName) {
@@ -133,6 +166,60 @@ public class RuntimeCatalog implements Serializable {
             }
         }
         return promoted;
+    }
+
+    public List<String> promotePrimaryToReplicaPair(String failedPrimaryNodeId, String newPrimaryNodeId) {
+        List<String> promoted = new ArrayList<>();
+        for (TableMetadata table : clusterMetadata.getTables()) {
+            for (ShardMetadata shard : new ArrayList<>(table.getShards())) {
+                if (!shard.getPrimaryNodeId().equalsIgnoreCase(failedPrimaryNodeId)) {
+                    continue;
+                }
+                table.replaceShard(new ShardMetadata(shard.getShardName(), shard.getTableName(),
+                        shard.getShardIndex(), newPrimaryNodeId, List.of()));
+                promoted.add(shard.getShardName() + "->" + newPrimaryNodeId);
+                routeVersion++;
+            }
+        }
+        return promoted;
+    }
+
+    public int attachReplicaToPrimary(String primaryNodeId, String replicaNodeId) {
+        int changed = 0;
+        for (TableMetadata table : clusterMetadata.getTables()) {
+            for (ShardMetadata shard : new ArrayList<>(table.getShards())) {
+                if (!shard.getPrimaryNodeId().equalsIgnoreCase(primaryNodeId)
+                        || containsIgnoreCase(shard.getReplicaNodeIds(), replicaNodeId)) {
+                    continue;
+                }
+                List<String> replicas = new ArrayList<>(shard.getReplicaNodeIds());
+                replicas.add(replicaNodeId);
+                table.replaceShard(new ShardMetadata(shard.getShardName(), shard.getTableName(),
+                        shard.getShardIndex(), shard.getPrimaryNodeId(), replicas));
+                changed++;
+                routeVersion++;
+            }
+        }
+        return changed;
+    }
+
+    public int detachReplica(String replicaNodeId) {
+        int changed = 0;
+        for (TableMetadata table : clusterMetadata.getTables()) {
+            for (ShardMetadata shard : new ArrayList<>(table.getShards())) {
+                if (!containsIgnoreCase(shard.getReplicaNodeIds(), replicaNodeId)) {
+                    continue;
+                }
+                List<String> replicas = shard.getReplicaNodeIds().stream()
+                        .filter(replica -> !replica.equalsIgnoreCase(replicaNodeId))
+                        .toList();
+                table.replaceShard(new ShardMetadata(shard.getShardName(), shard.getTableName(),
+                        shard.getShardIndex(), shard.getPrimaryNodeId(), replicas));
+                changed++;
+                routeVersion++;
+            }
+        }
+        return changed;
     }
 
     public int shardsContainingNode(String nodeId) {
@@ -200,6 +287,30 @@ public class RuntimeCatalog implements Serializable {
             }
         }
         return false;
+    }
+
+    private List<NodeRecord> primaryNodes(Collection<NodeRecord> nodes) {
+        return nodes.stream()
+                .filter(NodeRecord::isAvailable)
+                .filter(node -> node.role() == ReplicaRole.PRIMARY)
+                .sorted(Comparator.comparing(NodeRecord::nodeId))
+                .toList();
+    }
+
+    private boolean sameNodeIds(List<String> left, List<String> right) {
+        if (left.size() != right.size()) {
+            return false;
+        }
+        for (int i = 0; i < left.size(); i++) {
+            if (!left.get(i).equalsIgnoreCase(right.get(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean containsIgnoreCase(List<String> values, String value) {
+        return values.stream().anyMatch(item -> item.equalsIgnoreCase(value));
     }
 
     public record ShardOptions(String shardKey, int shardCount, int replicaCount) implements Serializable {

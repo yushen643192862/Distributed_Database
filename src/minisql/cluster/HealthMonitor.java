@@ -2,6 +2,7 @@ package minisql.cluster;
 
 import minisql.cluster.planner.RuntimeCatalog;
 import minisql.cluster.node.NodeRecord;
+import minisql.cluster.node.ReplicaRole;
 
 import java.time.Instant;
 import java.util.Map;
@@ -35,17 +36,40 @@ public class HealthMonitor {
     }
 
     private void checkNodes() {
-        long now = Instant.now().toEpochMilli();
-        for (NodeRecord node : dataNodes.values()) {
-            if (!node.isAvailable() || node.lastHeartbeatEpochMs() <= 0) {
-                continue;
+        try {
+            long now = Instant.now().toEpochMilli();
+            for (NodeRecord node : dataNodes.values()) {
+                checkNode(now, node);
             }
-            if (now - node.lastHeartbeatEpochMs() > timeoutMs) {
-                node.markOffline("Heartbeat timeout");
-                rebalancer.rebalance();
-                saveState();
-            }
+        } catch (RuntimeException ex) {
+            System.err.println("Health monitor check failed: " + ex.getMessage());
+            ex.printStackTrace(System.err);
         }
+    }
+
+    private void checkNode(long now, NodeRecord node) {
+        if (!node.isAvailable() || node.lastHeartbeatEpochMs() <= 0) {
+            return;
+        }
+        if (now - node.lastHeartbeatEpochMs() <= timeoutMs) {
+            return;
+        }
+
+        node.markOffline("Heartbeat timeout");
+        catalog.upsertNode(node.nodeId(), node.host(), node.port(), node.databaseType(), false);
+        if (node.role() == ReplicaRole.PRIMARY && node.partnerNodeId() != null) {
+            NodeRecord replica = dataNodes.get(node.partnerNodeId());
+            if (replica != null && replica.isAvailable()) {
+                replica.assignRole(ReplicaRole.PRIMARY, node.nodeId());
+                node.assignRole(ReplicaRole.REPLICA, replica.nodeId());
+                catalog.promotePrimaryToReplicaPair(node.nodeId(), replica.nodeId());
+            } else {
+                rebalancer.rebalance();
+            }
+        } else if (node.role() == ReplicaRole.PRIMARY) {
+            rebalancer.rebalance();
+        }
+        saveState();
     }
 
     private void saveState() {

@@ -2,6 +2,7 @@ package minisql.cluster;
 
 import minisql.cluster.planner.RuntimeCatalog;
 import minisql.cluster.node.NodeRecord;
+import minisql.cluster.node.ReplicaRole;
 import minisql.sql.QueryResult;
 
 import java.io.IOException;
@@ -11,6 +12,9 @@ import java.io.Serializable;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Map;
 
 public class MiniSqlSystem {
@@ -30,9 +34,10 @@ public class MiniSqlSystem {
         this.catalog = catalog;
         this.dataNodes = dataNodes;
         this.persistencePath = persistencePath;
+        initializeReplicaRoles();
         this.tableLocks = new TableLockManager();
         this.rebalancer = new ClusterRebalancer(catalog, dataNodes, tableLocks);
-        Coordinator coordinator = new Coordinator(catalog, dataNodes, tableLocks);
+        Coordinator coordinator = new Coordinator(catalog, dataNodes, tableLocks, rebalancer);
         this.coordinator = coordinator;
         this.rpcServer = new MasterRpcServer(catalog, dataNodes, coordinator, rebalancer, this::saveState, resolveMasterPort());
         this.rpcServer.start();
@@ -44,6 +49,7 @@ public class MiniSqlSystem {
         Path persistencePath = resolvePersistencePath();
         State state = loadState(persistencePath);
         if (state != null) {
+            prepareRecoveredRuntimeState(state.catalog(), state.dataNodes());
             return new MiniSqlSystem(state.catalog(), state.dataNodes(), persistencePath);
         }
 
@@ -57,6 +63,28 @@ public class MiniSqlSystem {
         }
 
         return new MiniSqlSystem(catalog, dataNodes, persistencePath);
+    }
+
+    private void initializeReplicaRoles() {
+        if (dataNodes.values().stream().anyMatch(node -> node.role() != null)) {
+            return;
+        }
+        int targetPrimaries = resolveTargetPrimaryCount();
+        List<NodeRecord> nodes = new ArrayList<>(dataNodes.values());
+        nodes.sort(Comparator.comparing(NodeRecord::nodeId));
+        List<NodeRecord> primaries = new ArrayList<>();
+        for (NodeRecord node : nodes) {
+            if (primaries.size() < targetPrimaries) {
+                node.assignRole(ReplicaRole.PRIMARY, null);
+                primaries.add(node);
+            } else {
+                NodeRecord primary = primaries.get((nodes.indexOf(node) - targetPrimaries) % primaries.size());
+                node.assignRole(ReplicaRole.REPLICA, primary.nodeId());
+                if (primary.partnerNodeId() == null) {
+                    primary.assignRole(ReplicaRole.PRIMARY, node.nodeId());
+                }
+            }
+        }
     }
 
     public QueryResult execute(String sql) {
@@ -98,6 +126,13 @@ public class MiniSqlSystem {
         }
     }
 
+    private static void prepareRecoveredRuntimeState(RuntimeCatalog catalog, Map<String, NodeRecord> dataNodes) {
+        for (NodeRecord node : dataNodes.values()) {
+            node.awaitRegistrationAfterRestart();
+            catalog.upsertNode(node.nodeId(), node.host(), node.port(), node.databaseType(), false);
+        }
+    }
+
     private static Path resolvePersistencePath() {
         String propertyValue = System.getProperty(DATA_PATH_PROPERTY);
         if (propertyValue != null && !propertyValue.isBlank()) {
@@ -132,6 +167,14 @@ public class MiniSqlSystem {
             return Long.parseLong(envValue);
         }
         return 5000;
+    }
+
+    private static int resolveTargetPrimaryCount() {
+        String value = System.getenv("MINISQL_PRIMARY_COUNT");
+        if (value == null || value.isBlank()) {
+            return 3;
+        }
+        return Integer.parseInt(value);
     }
 
     private record State(RuntimeCatalog catalog, Map<String, NodeRecord> dataNodes) implements Serializable {

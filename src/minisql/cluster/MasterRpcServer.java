@@ -5,6 +5,7 @@ import com.sun.net.httpserver.HttpServer;
 import minisql.cluster.planner.RuntimeCatalog;
 import minisql.cluster.node.NodeRecord;
 import minisql.cluster.node.NodeStatus;
+import minisql.cluster.node.ReplicaRole;
 import minisql.rpc.Json;
 import minisql.rpc.RpcMessage;
 import physical.DatabaseType;
@@ -14,7 +15,10 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.LinkedHashMap;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Map;
 
 public class MasterRpcServer {
@@ -24,6 +28,7 @@ public class MasterRpcServer {
     private final Coordinator coordinator;
     private final ClusterRebalancer rebalancer;
     private final Runnable stateSaver;
+    private final int targetPrimaryCount;
     private HttpServer server;
 
     public MasterRpcServer(RuntimeCatalog catalog, Map<String, NodeRecord> dataNodes,
@@ -35,6 +40,7 @@ public class MasterRpcServer {
         this.rebalancer = rebalancer;
         this.stateSaver = stateSaver;
         this.port = port;
+        this.targetPrimaryCount = resolveTargetPrimaryCount();
     }
 
     public void start() {
@@ -90,20 +96,162 @@ public class MasterRpcServer {
         DatabaseType databaseType = DatabaseType.valueOf(string(params, "databaseType").toUpperCase());
 
         NodeRecord node = dataNodes.computeIfAbsent(nodeId, NodeRecord::new);
-        boolean wasAvailable = node.isAvailable();
+        ReplicaRole oldRole = node.role();
+        boolean wasKnown = oldRole != null;
+        if (node.administrativelyFailed()) {
+            node.updateEndpoint(host, port, databaseType);
+            catalog.upsertNode(nodeId, host, port, databaseType, false);
+            saveState();
+            return registrationResult(nodeId, generated);
+        }
         node.register(host, port, databaseType);
+        RegistrationAction action = assignRoleOnRegistration(node, optionalString(params, "role"));
+        if (oldRole == ReplicaRole.REPLICA && node.role() != ReplicaRole.REPLICA) {
+            catalog.detachReplica(node.nodeId());
+        }
+        if (node.role() == ReplicaRole.REPLICA && node.partnerNodeId() != null) {
+            catalog.attachReplicaToPrimary(node.partnerNodeId(), node.nodeId());
+        }
         catalog.upsertNode(nodeId, host, port, databaseType, true);
-        if (!wasAvailable) {
+        if (action == RegistrationAction.REHASH || (oldRole != node.role() && node.role() == ReplicaRole.PRIMARY)) {
             rebalancer.rebalance();
+        } else if (action == RegistrationAction.REPAIR || wasKnown || node.role() == ReplicaRole.REPLICA) {
+            rebalancer.repair();
         }
         saveState();
 
+        return registrationResult(nodeId, generated);
+    }
+
+    private Map<String, Object> registrationResult(String nodeId, boolean generated) {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("accepted", true);
         result.put("nodeId", nodeId);
         result.put("assignedNodeId", nodeId);
         result.put("generated", generated);
         return result;
+    }
+
+    private RegistrationAction assignRoleOnRegistration(NodeRecord node, String requestedRole) {
+        if (node.role() != null) {
+            return repairExistingRole(node);
+        }
+        if (requestedRole != null && !requestedRole.isBlank()) {
+            ReplicaRole role = ReplicaRole.valueOf(requestedRole.toUpperCase());
+            if (role == ReplicaRole.PRIMARY) {
+                node.assignRole(ReplicaRole.PRIMARY, null);
+                NodeRecord replica = unpairedReplica();
+                if (replica != null) {
+                    node.assignRole(ReplicaRole.PRIMARY, replica.nodeId());
+                    replica.assignRole(ReplicaRole.REPLICA, node.nodeId());
+                }
+                return RegistrationAction.REHASH;
+            }
+            NodeRecord primary = primaryWithoutReplica();
+            node.assignRole(ReplicaRole.REPLICA, primary == null ? null : primary.nodeId());
+            if (primary != null) {
+                primary.assignRole(ReplicaRole.PRIMARY, node.nodeId());
+            }
+            return primary == null ? RegistrationAction.NONE : RegistrationAction.REPAIR;
+        }
+
+        if (primaryCountExcluding(node) < targetPrimaryCount) {
+            node.assignRole(ReplicaRole.PRIMARY, null);
+            NodeRecord replica = unpairedReplica();
+            if (replica != null) {
+                node.assignRole(ReplicaRole.PRIMARY, replica.nodeId());
+                replica.assignRole(ReplicaRole.REPLICA, node.nodeId());
+            }
+            return RegistrationAction.REHASH;
+        }
+
+        NodeRecord primary = primaryWithoutReplica();
+        if (primary != null) {
+            node.assignRole(ReplicaRole.REPLICA, primary.nodeId());
+            primary.assignRole(ReplicaRole.PRIMARY, node.nodeId());
+            return RegistrationAction.REPAIR;
+        }
+
+        node.assignRole(ReplicaRole.PRIMARY, null);
+        NodeRecord replica = unpairedReplica();
+        if (replica != null) {
+            node.assignRole(ReplicaRole.PRIMARY, replica.nodeId());
+            replica.assignRole(ReplicaRole.REPLICA, node.nodeId());
+        }
+        return RegistrationAction.REHASH;
+    }
+
+    private RegistrationAction repairExistingRole(NodeRecord node) {
+        if (node.role() == ReplicaRole.REPLICA) {
+            NodeRecord partner = node.partnerNodeId() == null ? null : dataNodes.get(node.partnerNodeId());
+            if (partner != null && partner.role() == ReplicaRole.PRIMARY) {
+                if (primaryNeedsThisReplica(partner, node)) {
+                    partner.assignRole(ReplicaRole.PRIMARY, node.nodeId());
+                    node.assignRole(ReplicaRole.REPLICA, partner.nodeId());
+                    return RegistrationAction.REPAIR;
+                }
+            }
+
+            NodeRecord primary = primaryWithoutReplica();
+            if (primary != null) {
+                node.assignRole(ReplicaRole.REPLICA, primary.nodeId());
+                primary.assignRole(ReplicaRole.PRIMARY, node.nodeId());
+                return RegistrationAction.REPAIR;
+            }
+            node.assignRole(ReplicaRole.PRIMARY, null);
+            return RegistrationAction.REHASH;
+        }
+
+        if (node.role() == ReplicaRole.PRIMARY && node.partnerNodeId() == null) {
+            NodeRecord replica = unpairedReplica();
+            if (replica != null) {
+                node.assignRole(ReplicaRole.PRIMARY, replica.nodeId());
+                replica.assignRole(ReplicaRole.REPLICA, node.nodeId());
+            }
+            return replica == null ? RegistrationAction.NONE : RegistrationAction.REPAIR;
+        }
+        return RegistrationAction.NONE;
+    }
+
+    private boolean primaryNeedsThisReplica(NodeRecord primary, NodeRecord replica) {
+        String partnerNodeId = primary.partnerNodeId();
+        return partnerNodeId == null
+                || partnerNodeId.equalsIgnoreCase(replica.nodeId())
+                || !isAvailable(partnerNodeId);
+    }
+
+    private long primaryCountExcluding(NodeRecord excluded) {
+        return dataNodes.values().stream()
+                .filter(node -> node != excluded)
+                .filter(node -> node.role() == ReplicaRole.PRIMARY)
+                .count();
+    }
+
+    private NodeRecord primaryWithoutReplica() {
+        return sortedNodes().stream()
+                .filter(node -> node.role() == ReplicaRole.PRIMARY)
+                .filter(node -> node.partnerNodeId() == null || !isAvailable(node.partnerNodeId()))
+                .findFirst()
+                .orElse(null);
+    }
+
+    private NodeRecord unpairedReplica() {
+        return sortedNodes().stream()
+                .filter(node -> node.role() == ReplicaRole.REPLICA)
+                .filter(node -> node.partnerNodeId() == null)
+                .findFirst()
+                .orElse(null);
+    }
+
+    private List<NodeRecord> sortedNodes() {
+        return dataNodes.values().stream()
+                .sorted(Comparator.comparing(NodeRecord::nodeId))
+                .toList();
+    }
+
+    private boolean isAvailable(String nodeId) {
+        NodeRecord node = dataNodes.get(nodeId);
+        return node != null && node.isAvailable();
     }
 
     private Map<String, Object> executeSql(Map<String, Object> params) {
@@ -120,7 +268,6 @@ public class MasterRpcServer {
     private Map<String, Object> heartbeat(Map<String, Object> params) {
         String nodeId = string(params, "nodeId");
         NodeRecord node = dataNodes.computeIfAbsent(nodeId, NodeRecord::new);
-        boolean wasAvailable = node.isAvailable();
         NodeStatus status = NodeStatus.valueOf(string(params, "status").toUpperCase());
         String host = optionalString(params, "host");
         String portValue = optionalString(params, "port");
@@ -128,16 +275,19 @@ public class MasterRpcServer {
         if (host != null && portValue != null && databaseTypeValue != null) {
             int port = integer(params, "port");
             DatabaseType databaseType = DatabaseType.valueOf(databaseTypeValue.toUpperCase());
-            node.register(host, port, databaseType);
-            catalog.upsertNode(nodeId, host, port, databaseType, true);
+            node.updateEndpoint(host, port, databaseType);
         }
         long reads = longValue(params.getOrDefault("readRequests", 0));
         long writes = longValue(params.getOrDefault("writeRequests", 0));
         Object lastError = params.get("lastError");
-        node.heartbeat(status, reads, writes, lastError == null ? null : lastError.toString());
-        if ((!wasAvailable && node.isAvailable()) || (node.isAvailable() && rebalancer.needsRebalance())) {
-            rebalancer.rebalance();
+        if (node.administrativelyFailed()) {
+            node.markOffline("Manually failed by coordinator");
+            catalog.upsertNode(nodeId, node.host(), node.port(), node.databaseType(), false);
+        } else {
+            node.heartbeat(status, reads, writes, lastError == null ? null : lastError.toString());
+            catalog.upsertNode(nodeId, node.host(), node.port(), node.databaseType(), node.isAvailable());
         }
+        detectTimedOutNodes(nodeId);
         saveState();
 
         Map<String, Object> result = new LinkedHashMap<>();
@@ -149,6 +299,33 @@ public class MasterRpcServer {
     private void saveState() {
         if (stateSaver != null) {
             stateSaver.run();
+        }
+    }
+
+    private void detectTimedOutNodes(String heartbeatNodeId) {
+        long timeoutMs = resolveHeartbeatTimeoutMs();
+        long now = Instant.now().toEpochMilli();
+        for (NodeRecord candidate : dataNodes.values()) {
+            if (candidate.nodeId().equalsIgnoreCase(heartbeatNodeId)
+                    || !candidate.isAvailable()
+                    || candidate.lastHeartbeatEpochMs() <= 0
+                    || now - candidate.lastHeartbeatEpochMs() <= timeoutMs) {
+                continue;
+            }
+            candidate.markOffline("Heartbeat timeout");
+            catalog.upsertNode(candidate.nodeId(), candidate.host(), candidate.port(), candidate.databaseType(), false);
+            if (candidate.role() == ReplicaRole.PRIMARY && candidate.partnerNodeId() != null) {
+                NodeRecord replica = dataNodes.get(candidate.partnerNodeId());
+                if (replica != null && replica.isAvailable()) {
+                    replica.assignRole(ReplicaRole.PRIMARY, candidate.nodeId());
+                    candidate.assignRole(ReplicaRole.REPLICA, replica.nodeId());
+                    catalog.promotePrimaryToReplicaPair(candidate.nodeId(), replica.nodeId());
+                } else {
+                    rebalancer.rebalance();
+                }
+            } else if (candidate.role() == ReplicaRole.PRIMARY) {
+                rebalancer.rebalance();
+            }
         }
     }
 
@@ -223,5 +400,27 @@ public class MasterRpcServer {
             return number.longValue();
         }
         return Long.parseLong(String.valueOf(value));
+    }
+
+    private int resolveTargetPrimaryCount() {
+        String value = System.getenv("MINISQL_PRIMARY_COUNT");
+        if (value == null || value.isBlank()) {
+            return 3;
+        }
+        return Integer.parseInt(value);
+    }
+
+    private long resolveHeartbeatTimeoutMs() {
+        String value = System.getenv("MINISQL_HEARTBEAT_TIMEOUT_MS");
+        if (value == null || value.isBlank()) {
+            return 5000;
+        }
+        return Long.parseLong(value);
+    }
+
+    private enum RegistrationAction {
+        NONE,
+        REPAIR,
+        REHASH
     }
 }

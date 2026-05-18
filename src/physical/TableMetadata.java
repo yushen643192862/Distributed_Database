@@ -31,6 +31,12 @@ public class TableMetadata implements Serializable {
         return shards;
     }
 
+    public TableMetadata setShards(List<ShardMetadata> replacements) {
+        shards.clear();
+        shards.addAll(replacements);
+        return this;
+    }
+
     public ShardMetadata shardForValue(Object value) {
         if (shards.isEmpty()) {
             throw new IllegalStateException("No shards for table: " + tableName);

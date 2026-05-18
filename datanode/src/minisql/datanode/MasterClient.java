@@ -29,6 +29,9 @@ public class MasterClient {
         params.put("host", config.host());
         params.put("port", config.port());
         params.put("databaseType", config.databaseType());
+        if (config.requestedRole() != null && !config.requestedRole().isBlank()) {
+            params.put("role", config.requestedRole());
+        }
         Map<String, Object> result = call("registerNode", params);
         Object assignedNodeId = result.get("assignedNodeId");
         if (assignedNodeId == null) {

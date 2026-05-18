@@ -46,7 +46,11 @@ public class JdbcSqlExecutor {
             result.put("columns", List.of());
             result.put("rows", List.of());
             result.put("affectedRows", 0);
-            result.put("error", ex.getMessage());
+            String message = ex.getMessage();
+            if (message == null || message.isBlank()) {
+                message = ex.getClass().getSimpleName() + " SQLState=" + ex.getSQLState() + " code=" + ex.getErrorCode();
+            }
+            result.put("error", message);
             return result;
         }
     }

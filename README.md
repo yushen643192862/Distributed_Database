@@ -1,25 +1,53 @@
-# Distributed MiniSQL
+﻿# Distributed MiniSQL
 
-这是一个用于课程设�?实验展示的分布式 MiniSQL 原型。当前实现采用“单进程模拟分布式集群”的方式：在一�?JVM 内模�?`Coordinator`、`MetaStore` �?3 �?`DataNode`，用于演示分片、主从副本、故障切换、恢复补齐、读负载均衡和跨分片查询�?
+Distributed MiniSQL 是一个用于课程实验和分布式数据库机制演示的简化系统。当前版本由 1 个 master、若干 datanode 和一个命令行客户端组成，支持 SQL 解析、哈希分片、主从副本、节点上下线、故障切换和简单的集群状态查看。
 
-说明：设计报告中�?ZooKeeper 在本实现中用内存版集群管理逻辑模拟，不额外引入真实 ZooKeeper 服务；核心行为和演示命令已覆盖�?
+## 当前架构
 
-## 当前能力
+```text
+sql-cli  --->  master/coordinator  --->  datanode
+              metadata + routing        H2 storage
+              node registry             physical shard tables
+              failover/rebalance
+```
 
-- 基础 SQL：`CREATE TABLE`、`DROP TABLE`、`INSERT`、`DELETE`、`UPDATE`、`SELECT`�?
-- 投影查询：支�?`SELECT sid, name FROM student WHERE dept = 'CS';`�?
-- 哈希分片：`SHARD BY HASH(column) SHARDS n`�?
-- 副本管理：支�?`REPLICAS 3`，每�?shard 采用 1 �?2 从�?
-- 分布式查询：分片键条件走分片裁剪，非分片键条件广播查询�?
-- JOIN：支持等值内连接�?
-- 集群管理：支持节点状态、读写计数、路由版本和拓扑展示�?
-- 容错容灾：主副本节点故障后自动从健康从副本中切主�?
-- 恢复补齐：故障节点恢复后从健康副本同步缺�?shard 数据�?
-- 负载均衡：普通读请求在健康副本之间轮询分配�?
-- 持久化：退出后保存快照，重启可恢复表结构、数据和集群状态�?
-- 客户端：每条 SQL 输出执行耗时�?
+主要模块：
 
-## 支持�?SQL
+```text
+src/          master/coordinator、SQL 解析、路由元数据、集群管理
+
+datanode/     datanode 服务，负责接收 master RPC 并执行 H2/JDBC SQL
+sql-cli/      命令行客户端，连接 master 提交 SQL
+docker-compose.yml  本地容器化启动 1 master + 多个 datanode
+```
+
+## 主从和分片规则
+
+当前系统的默认参数是 `MINISQL_PRIMARY_COUNT=3`，也就是冷启动时先形成：
+
+```text
+1 个 master
+3 个 primary datanode
+3 个 replica datanode
+```
+
+也可以理解为 1 个 master + 2k 个 datanode，初始 `k=3`。其中 k 个 datanode 是主副本节点，k 个 datanode 是从副本节点。
+
+节点角色由 master 在注册时分配：
+
+- 前 `MINISQL_PRIMARY_COUNT` 个 datanode 优先成为 `PRIMARY`。
+- 后续 datanode 会优先补到没有从节点的 primary 上，成为 `REPLICA`。
+- 如果所有 primary 都已经有在线 replica，新 datanode 会成为新的 `PRIMARY`，此时 master 会按新的 primary 数重新哈希分片。
+- primary 挂掉且它有在线 replica 时，replica 会提升为 primary，路由表更新，但不会重新哈希整张表。
+- primary 挂掉且没有在线 replica 时，该 primary 对应的分片没有可用副本，系统会尝试按剩余 primary 重新分片；如果没有在线数据源，对应数据无法恢复。
+- 旧 replica 恢复上线时，如果原 primary 已经有新的在线 replica，它不会再抢回原来的从节点位置；如果没有其他 primary 缺 replica，它会成为新的 primary 并触发重新哈希。
+
+重新哈希只在两类拓扑变化中发生：
+
+- 新加入 datanode 导致 primary 数量增加，例如 3 个 primary 变 4 个 primary。
+- 删除或故障导致某个没有 replica 的 primary 分片必须从路由中移除，例如 5 个 primary 变 4 个 primary。
+
+## 支持的常用 SQL
 
 ```sql
 CREATE TABLE table_name (...) SHARD BY HASH(column) SHARDS n REPLICAS r;
@@ -29,104 +57,234 @@ DELETE FROM table_name WHERE column = value;
 UPDATE table_name SET column = value WHERE column = value;
 SELECT * FROM table_name;
 SELECT column1, column2 FROM table_name WHERE column = value;
-SELECT left_table.column, right_table.column FROM left_table JOIN right_table ON left_table.column = right_table.column;
+SELECT left_table.column, right_table.column
+FROM left_table JOIN right_table ON left_table.column = right_table.column;
+
+SHOW NODES;
 SHOW SHARDS;
 SHOW SHARDS table_name;
-SHOW NODES;
+SHOW TABLES;
 SHOW CLUSTER;
 FAIL NODE dn1;
 RECOVER NODE dn1;
+REMOVE NODE dn1;
+REBALANCE CLUSTER;
 ```
 
-## 本地运行
+说明：
+
+- `SHOW NODES` 查看节点在线状态、角色、partner、读写计数。
+- `SHOW SHARDS` 查看 master 的路由元数据。
+- `SHOW TABLES` 查看 datanode 上真实存在的物理分片表。
+- `REBALANCE CLUSTER` 当前主要用于修复物理表和清理过期分片，不强制改变分片数量。
+
+## 本地手动运行
+
+要求：JDK 17、Maven。
+
+### 1. 编译
+
+在项目根目录执行：
 
 ```powershell
+cd D:\distributed_minisql_
 mvn compile
-java -cp target\classes minisql.app.App
+
+cd D:\distributed_minisql_\datanode
+mvn compile dependency:copy-dependencies
+
+cd D:\distributed_minisql_\sql-cli
+mvn compile
 ```
 
-默认数据文件�?
+### 2. 启动 master
+
+新开一个 PowerShell：
+
+```powershell
+cd D:\distributed_minisql_
+$env:MINISQL_SERVER_MODE="true"
+$env:MINISQL_MASTER_PORT="8080"
+$env:MINISQL_PRIMARY_COUNT="3"
+$env:MINISQL_HEARTBEAT_TIMEOUT_MS="5000"
+$env:MINISQL_DATA="data\terminal-sim-state.bin"
+java -cp "target\classes" minisql.app.App
+```
+
+### 3. 启动 datanode
+
+每个 datanode 开一个 PowerShell。以 dn1 为例：
+
+```powershell
+cd D:\distributed_minisql_\datanode
+$env:MINISQL_NODE_ID="dn1"
+$env:MINISQL_NODE_HOST="127.0.0.1"
+$env:MINISQL_NODE_PORT="9101"
+$env:MINISQL_MASTER_URL="http://127.0.0.1:8080"
+$env:MINISQL_DATABASE_TYPE="H2"
+$env:MINISQL_JDBC_URL="jdbc:h2:./data/terminal-dn1"
+$env:MINISQL_JDBC_USER="sa"
+$env:MINISQL_JDBC_PASSWORD=""
+java -cp "target\classes;target\dependency\*" minisql.datanode.DataNodeServer
+```
+
+常用节点参数：
 
 ```text
-data/minisql-state.bin
+dn1  9101  jdbc:h2:./data/terminal-dn1
+dn2  9102  jdbc:h2:./data/terminal-dn2
+dn3  9103  jdbc:h2:./data/terminal-dn3
+dn4  9104  jdbc:h2:./data/terminal-dn4
+dn5  9105  jdbc:h2:./data/terminal-dn5
+dn6  9106  jdbc:h2:./data/terminal-dn6
+dn7  9107  jdbc:h2:./data/terminal-dn7
+dn8  9108  jdbc:h2:./data/terminal-dn8
+dn9  9109  jdbc:h2:./data/terminal-dn9
 ```
 
-指定数据文件�?
+如果需要强制请求角色，可以额外设置：
 
 ```powershell
-java "-Dminisql.data=D:\minisql-data\state.bin" -cp target\classes minisql.app.App
+$env:MINISQL_NODE_ROLE="PRIMARY"
 ```
 
-## Docker 演示
+或：
 
 ```powershell
-docker build -t distributed-minisql:local .
-docker volume create minisql-data
-docker run --rm -it -v minisql-data:/app/data distributed-minisql:local
+$env:MINISQL_NODE_ROLE="REPLICA"
 ```
 
-也可以用 Docker Compose�?
+通常测试时不需要手动指定，交给 master 分配即可。
+
+### 4. 启动客户端
+
+`sql-cli` 是客户端，`minisql.app.App` 是 master/coordinator 服务。
 
 ```powershell
-docker compose run --rm minisql
+cd D:\distributed_minisql_\sql-cli
+java -cp "target\classes" minisql.cli.SqlCli http://127.0.0.1:8080
 ```
 
-如果旧数据卷来自旧版本序列化格式，先清空一次：
+退出客户端：
+
+```text
+exit
+```
+
+## Docker Compose 运行
+
+默认 compose 会启动：
+
+```text
+master + dn1 + dn2 + dn3 + dn4 + dn5 + dn6
+```
+
+也就是初始 `k=3` 的 3 主 3 从集群。
 
 ```powershell
-docker volume rm minisql-data
-docker volume create minisql-data
+cd D:\distributed_minisql_
+docker compose -p minisql build
+docker compose -p minisql up -d
+docker compose -p minisql ps
 ```
 
-## 完整验收测试
-
-本地�?
+查看日志：
 
 ```powershell
-mvn compile
-Get-Content tests\acceptance.sql | java "-Dminisql.data=target\acceptance-state.bin" -cp target\classes minisql.app.App
+docker compose -p minisql logs -f master
+docker compose -p minisql logs -f dn1
 ```
 
-Docker�?
+停止集群但保留数据：
 
 ```powershell
-docker build -t distributed-minisql:local .
-docker volume rm minisql-test-data
-docker volume create minisql-test-data
-Get-Content tests\acceptance.sql | docker run --rm -i -v minisql-test-data:/app/data distributed-minisql:local
+docker compose -p minisql down
 ```
 
-测试说明�?[tests/test-cases.md](tests/test-cases.md)�?
+停止并删除 volume，重新开始干净测试：
 
-## 演示片段
+```powershell
+docker compose -p minisql down -v
+```
+
+启动扩容测试节点 dn7、dn8、dn9：
+
+```powershell
+docker compose -p minisql --profile scale-test up -d dn7 dn8 dn9
+```
+
+单独停掉某个容器模拟故障：
+
+```powershell
+docker compose -p minisql stop dn1
+```
+
+恢复节点：
+
+```powershell
+docker compose -p minisql start dn1
+```
+
+## 测试数据
+
+### student 表
 
 ```sql
-CREATE TABLE student (sid INT PRIMARY KEY, name CHAR(20), age INT, dept CHAR(20)) SHARD BY HASH(sid) SHARDS 3 REPLICAS 3;
-INSERT INTO student VALUES (1001, 'Alice', 20, 'CS');
-INSERT INTO student VALUES (1002, 'Bob', 21, 'Math');
+CREATE TABLE student (sid INT PRIMARY KEY, name CHAR(20), age INT, dept CHAR(20)) SHARD BY HASH(sid) SHARDS 4 REPLICAS 2;
+INSERT INTO student VALUES (1001, 'Alice', 21, 'CS');
+INSERT INTO student VALUES (1002, 'Bob', 20, 'Math');
 INSERT INTO student VALUES (1003, 'Cindy', 22, 'CS');
-SHOW SHARDS student;
-SHOW CLUSTER;
-SELECT sid, name FROM student WHERE dept = 'CS';
+INSERT INTO student VALUES (1004, 'David', 19, 'SE');
+INSERT INTO student VALUES (1005, 'Eva', 23, 'AI');
+INSERT INTO student VALUES (1006, 'Frank', 20, 'Security');
 ```
 
-故障切换�?
+### course 表
 
 ```sql
-FAIL NODE dn2;
-SHOW CLUSTER;
-SELECT * FROM student WHERE sid = 1001;
-RECOVER NODE dn2;
-SHOW CLUSTER;
+CREATE TABLE course (cid INT PRIMARY KEY, sid INT, cname CHAR(20), credit INT) SHARD BY HASH(sid) SHARDS 4 REPLICAS 2;
+INSERT INTO course VALUES (1, 1001, 'Database', 4);
+INSERT INTO course VALUES (2, 1002, 'Network', 3);
+INSERT INTO course VALUES (3, 1003, 'OS', 4);
+INSERT INTO course VALUES (4, 1004, 'Compiler', 3);
+INSERT INTO course VALUES (5, 1005, 'AI', 3);
+INSERT INTO course VALUES (6, 1006, 'Security', 2);
 ```
 
-JOIN�?
+Join 测试：
 
 ```sql
-CREATE TABLE course (cid INT PRIMARY KEY, sid INT, cname CHAR(20)) SHARD BY HASH(sid) SHARDS 3 REPLICAS 3;
-INSERT INTO course VALUES (1, 1001, 'Database');
-INSERT INTO course VALUES (2, 1003, 'Network');
 SELECT student.name, course.cname FROM student JOIN course ON student.sid = course.sid;
 ```
 
-输入 `exit` �?`quit` 退出�?
+状态检查：
+
+```sql
+SHOW NODES;
+SHOW SHARDS student;
+SHOW SHARDS course;
+SHOW TABLES;
+```
+
+## 数据文件
+
+master 元数据默认保存在：
+
+```text
+data/terminal-sim-state.bin
+```
+
+手动运行 datanode 时，H2 数据默认在：
+
+```text
+datanode/data/terminal-dn1.mv.db
+datanode/data/terminal-dn2.mv.db
+...
+```
+
+清空本地手动测试状态会删除测试数据：
+
+```powershell
+Remove-Item D:\distributed_minisql_\data\terminal-sim-state.bin -ErrorAction SilentlyContinue
+Remove-Item D:\distributed_minisql_\datanode\data\terminal-dn*.* -ErrorAction SilentlyContinue
+```

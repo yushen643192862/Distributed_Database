@@ -1,31 +1,43 @@
+x-datanode-common: &datanode-common
+  build:
+    context: ./datanode
+  image: distributed-minisql-datanode:local
+  depends_on:
+    - master
+  environment:
+    MINISQL_MASTER_URL: http://master:8080
+    MINISQL_DATABASE_TYPE: H2
+    MINISQL_JDBC_USER: sa
+    MINISQL_JDBC_PASSWORD: ""
+
 services:
   master:
     build:
-      context: ./Distributed_Database
+      context: .
     image: distributed-minisql-master:local
     container_name: minisql-master
     environment:
-      MINISQL_DATA: /app/data/minisql-state.bin
-      MINISQL_MASTER_PORT: 8080
       MINISQL_SERVER_MODE: "true"
+      MINISQL_MASTER_PORT: 8080
+      MINISQL_PRIMARY_COUNT: 3
+      MINISQL_HEARTBEAT_TIMEOUT_MS: 5000
+      MINISQL_DATA: /app/data/minisql-state.bin
     ports:
       - "8080:8080"
     volumes:
       - master-data:/app/data
 
   dn1:
-    build:
-      context: ./datanode
-    image: distributed-minisql-datanode:local
+    <<: *datanode-common
     container_name: minisql-dn1
-    depends_on:
-      - master
     environment:
+      MINISQL_MASTER_URL: http://master:8080
+      MINISQL_DATABASE_TYPE: H2
+      MINISQL_JDBC_USER: sa
+      MINISQL_JDBC_PASSWORD: ""
       MINISQL_NODE_ID: dn1
       MINISQL_NODE_HOST: dn1
       MINISQL_NODE_PORT: 9101
-      MINISQL_MASTER_URL: http://master:8080
-      MINISQL_DATABASE_TYPE: H2
       MINISQL_JDBC_URL: jdbc:h2:/app/data/dn1
     ports:
       - "9101:9101"
@@ -33,18 +45,16 @@ services:
       - dn1-data:/app/data
 
   dn2:
-    build:
-      context: ./datanode
-    image: distributed-minisql-datanode:local
+    <<: *datanode-common
     container_name: minisql-dn2
-    depends_on:
-      - master
     environment:
+      MINISQL_MASTER_URL: http://master:8080
+      MINISQL_DATABASE_TYPE: H2
+      MINISQL_JDBC_USER: sa
+      MINISQL_JDBC_PASSWORD: ""
       MINISQL_NODE_ID: dn2
       MINISQL_NODE_HOST: dn2
       MINISQL_NODE_PORT: 9101
-      MINISQL_MASTER_URL: http://master:8080
-      MINISQL_DATABASE_TYPE: H2
       MINISQL_JDBC_URL: jdbc:h2:/app/data/dn2
     ports:
       - "9102:9101"
@@ -52,26 +62,138 @@ services:
       - dn2-data:/app/data
 
   dn3:
-    build:
-      context: ./datanode
-    image: distributed-minisql-datanode:local
+    <<: *datanode-common
     container_name: minisql-dn3
-    depends_on:
-      - master
     environment:
+      MINISQL_MASTER_URL: http://master:8080
+      MINISQL_DATABASE_TYPE: H2
+      MINISQL_JDBC_USER: sa
+      MINISQL_JDBC_PASSWORD: ""
       MINISQL_NODE_ID: dn3
       MINISQL_NODE_HOST: dn3
       MINISQL_NODE_PORT: 9101
-      MINISQL_MASTER_URL: http://master:8080
-      MINISQL_DATABASE_TYPE: H2
       MINISQL_JDBC_URL: jdbc:h2:/app/data/dn3
     ports:
       - "9103:9101"
     volumes:
       - dn3-data:/app/data
 
+  dn4:
+    <<: *datanode-common
+    container_name: minisql-dn4
+    environment:
+      MINISQL_MASTER_URL: http://master:8080
+      MINISQL_DATABASE_TYPE: H2
+      MINISQL_JDBC_USER: sa
+      MINISQL_JDBC_PASSWORD: ""
+      MINISQL_NODE_ID: dn4
+      MINISQL_NODE_HOST: dn4
+      MINISQL_NODE_PORT: 9101
+      MINISQL_JDBC_URL: jdbc:h2:/app/data/dn4
+    ports:
+      - "9104:9101"
+    volumes:
+      - dn4-data:/app/data
+
+  dn5:
+    <<: *datanode-common
+    container_name: minisql-dn5
+    environment:
+      MINISQL_MASTER_URL: http://master:8080
+      MINISQL_DATABASE_TYPE: H2
+      MINISQL_JDBC_USER: sa
+      MINISQL_JDBC_PASSWORD: ""
+      MINISQL_NODE_ID: dn5
+      MINISQL_NODE_HOST: dn5
+      MINISQL_NODE_PORT: 9101
+      MINISQL_JDBC_URL: jdbc:h2:/app/data/dn5
+    ports:
+      - "9105:9101"
+    volumes:
+      - dn5-data:/app/data
+
+  dn6:
+    <<: *datanode-common
+    container_name: minisql-dn6
+    environment:
+      MINISQL_MASTER_URL: http://master:8080
+      MINISQL_DATABASE_TYPE: H2
+      MINISQL_JDBC_USER: sa
+      MINISQL_JDBC_PASSWORD: ""
+      MINISQL_NODE_ID: dn6
+      MINISQL_NODE_HOST: dn6
+      MINISQL_NODE_PORT: 9101
+      MINISQL_JDBC_URL: jdbc:h2:/app/data/dn6
+    ports:
+      - "9106:9101"
+    volumes:
+      - dn6-data:/app/data
+
+  dn7:
+    <<: *datanode-common
+    container_name: minisql-dn7
+    profiles:
+      - scale-test
+    environment:
+      MINISQL_MASTER_URL: http://master:8080
+      MINISQL_DATABASE_TYPE: H2
+      MINISQL_JDBC_USER: sa
+      MINISQL_JDBC_PASSWORD: ""
+      MINISQL_NODE_ID: dn7
+      MINISQL_NODE_HOST: dn7
+      MINISQL_NODE_PORT: 9101
+      MINISQL_JDBC_URL: jdbc:h2:/app/data/dn7
+    ports:
+      - "9107:9101"
+    volumes:
+      - dn7-data:/app/data
+
+  dn8:
+    <<: *datanode-common
+    container_name: minisql-dn8
+    profiles:
+      - scale-test
+    environment:
+      MINISQL_MASTER_URL: http://master:8080
+      MINISQL_DATABASE_TYPE: H2
+      MINISQL_JDBC_USER: sa
+      MINISQL_JDBC_PASSWORD: ""
+      MINISQL_NODE_ID: dn8
+      MINISQL_NODE_HOST: dn8
+      MINISQL_NODE_PORT: 9101
+      MINISQL_JDBC_URL: jdbc:h2:/app/data/dn8
+    ports:
+      - "9108:9101"
+    volumes:
+      - dn8-data:/app/data
+
+  dn9:
+    <<: *datanode-common
+    container_name: minisql-dn9
+    profiles:
+      - scale-test
+    environment:
+      MINISQL_MASTER_URL: http://master:8080
+      MINISQL_DATABASE_TYPE: H2
+      MINISQL_JDBC_USER: sa
+      MINISQL_JDBC_PASSWORD: ""
+      MINISQL_NODE_ID: dn9
+      MINISQL_NODE_HOST: dn9
+      MINISQL_NODE_PORT: 9101
+      MINISQL_JDBC_URL: jdbc:h2:/app/data/dn9
+    ports:
+      - "9109:9101"
+    volumes:
+      - dn9-data:/app/data
+
 volumes:
   master-data:
   dn1-data:
   dn2-data:
   dn3-data:
+  dn4-data:
+  dn5-data:
+  dn6-data:
+  dn7-data:
+  dn8-data:
+  dn9-data:

@@ -176,9 +176,16 @@ public class PhysicalPlanBuilder {
 
     private List<String> writeNodeIds(ShardMetadata shard) {
         List<String> nodeIds = new ArrayList<>();
-        nodeIds.add(shard.getPrimaryNodeId());
+        if (isAlive(shard.getPrimaryNodeId())) {
+            nodeIds.add(shard.getPrimaryNodeId());
+        }
         nodeIds.addAll(shard.getReplicaNodeIds());
-        return nodeIds;
+        return nodeIds.stream().filter(this::isAlive).distinct().toList();
+    }
+
+    private boolean isAlive(String nodeId) {
+        DataNodeMetadata node = metadata.getNode(nodeId);
+        return node == null || node.isAlive();
     }
 
     private List<ShardMetadata> ddlShards(String tableName) {

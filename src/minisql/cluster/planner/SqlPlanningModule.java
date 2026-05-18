@@ -1,5 +1,6 @@
 package minisql.cluster.planner;
 
+import minisql.cluster.node.NodeRecord;
 import parser.parser.ASTNode;
 import parser.parser.AlterTableStatement;
 import parser.parser.CreateTableStatement;
@@ -34,17 +35,17 @@ public class SqlPlanningModule {
         this.catalog = catalog;
     }
 
-    public PlannedSql plan(String sql, Collection<String> nodeIds) {
-        PreparedSql prepared = prepare(sql, nodeIds.size());
+    public PlannedSql plan(String sql, Collection<NodeRecord> nodes) {
+        PreparedSql prepared = prepare(sql, nodes.size());
         ASTNode ast = new Parser(prepared.sql()).parseStatement();
 
         new SemanticAnalyzer(catalog.schemaCatalog()).analyze(ast);
         RuntimeCatalog.ShardOptions shardOptions = prepared.shardOptions();
         if (ast instanceof CreateTableStatement create) {
             if (shardOptions == null) {
-                shardOptions = defaultShardOptions(create, nodeIds.size());
+                shardOptions = defaultShardOptions(create, nodes.size());
             }
-            catalog.registerCreateTable(create, shardOptions, nodeIds);
+            catalog.registerCreateTable(create, shardOptions, nodes);
         }
         if (ast instanceof InsertStatement insert && insert.columns.isEmpty()) {
             fillImplicitInsertColumns(insert);

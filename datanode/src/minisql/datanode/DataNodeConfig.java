@@ -12,7 +12,8 @@ public record DataNodeConfig(
         String jdbcUrl,
         String jdbcUser,
         String jdbcPassword,
-        String jdbcDriver
+        String jdbcDriver,
+        String requestedRole
 ) {
     public static DataNodeConfig fromArgs(String[] args) {
         Map<String, String> values = new HashMap<>();
@@ -31,7 +32,8 @@ public record DataNodeConfig(
                 value(values, "jdbcUrl", "MINISQL_JDBC_URL", "jdbc:h2:./data/dn1"),
                 value(values, "jdbcUser", "MINISQL_JDBC_USER", "sa"),
                 value(values, "jdbcPassword", "MINISQL_JDBC_PASSWORD", ""),
-                value(values, "jdbcDriver", "MINISQL_JDBC_DRIVER", "")
+                value(values, "jdbcDriver", "MINISQL_JDBC_DRIVER", ""),
+                value(values, "role", "MINISQL_NODE_ROLE", "")
         );
     }
 

@@ -11,10 +11,13 @@ public class NodeRecord implements Serializable {
     private int port;
     private DatabaseType databaseType = DatabaseType.POSTGRESQL;
     private NodeStatus status = NodeStatus.OFFLINE;
+    private ReplicaRole role;
+    private String partnerNodeId;
     private long readRequests;
     private long writeRequests;
     private long lastHeartbeatEpochMs;
     private String lastError;
+    private boolean administrativelyFailed;
 
     public NodeRecord(String nodeId) {
         this.nodeId = nodeId;
@@ -40,6 +43,23 @@ public class NodeRecord implements Serializable {
         return status == NodeStatus.ONLINE;
     }
 
+    public ReplicaRole role() {
+        return role;
+    }
+
+    public boolean isPrimaryRole() {
+        return role == ReplicaRole.PRIMARY;
+    }
+
+    public String partnerNodeId() {
+        return partnerNodeId;
+    }
+
+    public void assignRole(ReplicaRole role, String partnerNodeId) {
+        this.role = role;
+        this.partnerNodeId = partnerNodeId;
+    }
+
     public NodeStatus status() {
         return status;
     }
@@ -60,6 +80,16 @@ public class NodeRecord implements Serializable {
         return lastError;
     }
 
+    public boolean administrativelyFailed() {
+        return administrativelyFailed;
+    }
+
+    public void updateEndpoint(String host, int port, DatabaseType databaseType) {
+        this.host = host;
+        this.port = port;
+        this.databaseType = databaseType;
+    }
+
     public void register(String host, int port, DatabaseType databaseType) {
         this.host = host;
         this.port = port;
@@ -67,6 +97,7 @@ public class NodeRecord implements Serializable {
         this.status = NodeStatus.ONLINE;
         this.lastHeartbeatEpochMs = Instant.now().toEpochMilli();
         this.lastError = null;
+        this.administrativelyFailed = false;
     }
 
     public void heartbeat(NodeStatus status, long readRequests, long writeRequests, String lastError) {
@@ -82,11 +113,23 @@ public class NodeRecord implements Serializable {
         this.lastError = reason;
     }
 
+    public void awaitRegistrationAfterRestart() {
+        if (administrativelyFailed) {
+            markOffline("Manually failed by coordinator");
+            return;
+        }
+        status = NodeStatus.OFFLINE;
+        lastHeartbeatEpochMs = 0;
+        lastError = "Awaiting DataNode registration after master restart";
+    }
+
     public void fail() {
+        administrativelyFailed = true;
         markOffline("Manually failed by coordinator");
     }
 
     public void recovering() {
+        administrativelyFailed = false;
         status = NodeStatus.RECOVERING;
     }
 

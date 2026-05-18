@@ -1,6 +1,7 @@
 package minisql.cluster;
 
 import minisql.cluster.node.NodeRecord;
+import minisql.cluster.node.ReplicaRole;
 import minisql.cluster.planner.RuntimeCatalog;
 import parser.semantic.ColumnSchema;
 import parser.semantic.TableSchema;
@@ -11,6 +12,10 @@ import physical.TableMetadata;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.List;
 import java.util.Map;
 
@@ -27,9 +32,21 @@ public class ClusterRebalancer {
     }
 
     public synchronized List<String> rebalance() {
-        List<NodeRecord> onlineNodes = onlineNodes();
+        return rebalance(Set.of());
+    }
+
+    public synchronized List<String> rebalance(Set<String> excludedNodeIds) {
+        return rebalance(excludedNodeIds, false);
+    }
+
+    public synchronized List<String> reshard(Set<String> excludedNodeIds) {
+        return rebalance(excludedNodeIds, true);
+    }
+
+    private List<String> rebalance(Set<String> excludedNodeIds, boolean forceReshard) {
+        List<NodeRecord> primaryNodes = primaryNodes(excludedNodeIds);
         List<String> changes = new ArrayList<>();
-        if (onlineNodes.isEmpty() || catalog.clusterMetadata().getTables().isEmpty()) {
+        if (primaryNodes.isEmpty() || catalog.clusterMetadata().getTables().isEmpty()) {
             return changes;
         }
 
@@ -39,22 +56,27 @@ public class ClusterRebalancer {
                 if (schema == null) {
                     continue;
                 }
+                if (forceReshard || table.getShards().size() != primaryNodes.size()) {
+                    changes.addAll(reshardTable(table, schema, primaryNodes, excludedNodeIds));
+                    continue;
+                }
                 for (ShardMetadata shard : new ArrayList<>(table.getShards())) {
                     List<String> current = shardNodeIds(shard);
-                    int copyCount = Math.min(Math.max(1, current.size()), onlineNodes.size());
-                    List<String> desired = desiredNodeIds(shard.getShardIndex(), copyCount, onlineNodes);
-                    if (current.equals(desired)) {
-                        continue;
-                    }
+                    List<String> desired = desiredNodeIds(shard.getShardIndex(), primaryNodes, excludedNodeIds);
 
-                    NodeRecord source = sourceNode(current);
+                    NodeRecord source = sourceNode(current, shard.getShardName());
                     if (source == null) {
                         throw new IllegalStateException("No online source copy for shard " + shard.getShardName());
                     }
                     for (String nodeId : desired) {
-                        if (!current.contains(nodeId)) {
+                        if (isAvailable(nodeId) && (!current.contains(nodeId)
+                                || !hasPhysicalShard(requireNode(nodeId), shard.getShardName()))) {
                             copyShard(source, requireNode(nodeId), schema, shard.getShardName());
                         }
+                    }
+
+                    if (current.equals(desired)) {
+                        continue;
                     }
 
                     table.replaceShard(new ShardMetadata(
@@ -73,20 +95,122 @@ public class ClusterRebalancer {
                     }
                 }
             }
+            cleanupStaleShards();
         }
         return changes;
     }
 
+    public synchronized List<String> repair() {
+        List<String> changes = new ArrayList<>();
+        if (catalog.clusterMetadata().getTables().isEmpty()) {
+            return changes;
+        }
+
+        try (TableLockManager.TableLocks ignored = tableLocks.lockTables(tableNames(), true)) {
+            for (TableMetadata table : catalog.clusterMetadata().getTables()) {
+                TableSchema schema = catalog.schemaCatalog().getTable(table.getTableName());
+                if (schema == null) {
+                    continue;
+                }
+                for (ShardMetadata shard : new ArrayList<>(table.getShards())) {
+                    List<String> desired = shardNodeIds(shard);
+                    NodeRecord source = sourceNode(desired, shard.getShardName());
+                    if (source == null) {
+                        continue;
+                    }
+                    for (String nodeId : desired) {
+                        if (isAvailable(nodeId) && !hasPhysicalShard(requireNode(nodeId), shard.getShardName())) {
+                            copyShard(source, requireNode(nodeId), schema, shard.getShardName());
+                            changes.add("repair " + shard.getShardName() + " -> " + nodeId);
+                        }
+                    }
+                }
+            }
+            cleanupStaleShards();
+        }
+        return changes;
+    }
+
+    private List<String> reshardTable(TableMetadata table, TableSchema schema,
+                                      List<NodeRecord> primaryNodes, Set<String> excludedNodeIds) {
+        List<String> changes = new ArrayList<>();
+        List<ShardMetadata> oldShards = new ArrayList<>(table.getShards());
+        List<String> columns = schema.getColumns().stream().map(ColumnSchema::getName).toList();
+        Map<Integer, List<List<Object>>> rowsByNewShard = new HashMap<>();
+
+        for (ShardMetadata oldShard : oldShards) {
+            NodeRecord source = sourceNode(shardNodeIds(oldShard), oldShard.getShardName());
+            if (source == null) {
+                throw new IllegalStateException("Cannot reshard " + table.getTableName()
+                        + ": no online source copy for " + oldShard.getShardName()
+                        + ". Recover its primary/replica before deleting or rehashing.");
+            }
+            RemoteSqlResult sourceRows = execute(source, "SELECT * FROM " + quote(oldShard.getShardName(), source.databaseType()) + ";");
+            if (!sourceRows.success()) {
+                throw new IllegalStateException("Cannot read shard " + oldShard.getShardName()
+                        + " from " + source.nodeId() + ": " + sourceRows.error());
+            }
+            List<String> rowColumns = sourceRows.columns().isEmpty() ? columns : sourceRows.columns();
+            int partitionIndex = columnIndex(rowColumns, table.getPartitionKey());
+            for (List<Object> row : sourceRows.rows()) {
+                Object partitionValue = row.get(partitionIndex);
+                int newShardIndex = Math.floorMod(partitionValue.hashCode(), primaryNodes.size());
+                rowsByNewShard.computeIfAbsent(newShardIndex, ignored -> new ArrayList<>()).add(row);
+            }
+            if (!sourceRows.columns().isEmpty()) {
+                columns = sourceRows.columns();
+            }
+        }
+
+        List<ShardMetadata> newShards = new ArrayList<>();
+        for (int shardIndex = 0; shardIndex < primaryNodes.size(); shardIndex++) {
+            NodeRecord primary = primaryNodes.get(shardIndex);
+            List<String> nodeIds = desiredNodeIds(shardIndex, primaryNodes, excludedNodeIds);
+            String shardName = table.getTableName() + "_" + shardIndex;
+            for (String nodeId : nodeIds) {
+                if (!isAvailable(nodeId)) {
+                    continue;
+                }
+                NodeRecord target = requireNode(nodeId);
+                executeRequired(target, "DROP TABLE IF EXISTS " + quote(shardName, target.databaseType()) + ";");
+                executeRequired(target, createTableSql(schema, shardName, target.databaseType()));
+                List<List<Object>> rows = rowsByNewShard.getOrDefault(shardIndex, List.of());
+                if (!rows.isEmpty()) {
+                    executeRequired(target, insertSql(shardName, columns, rows, target.databaseType()));
+                }
+            }
+            newShards.add(new ShardMetadata(
+                    shardName,
+                    table.getTableName(),
+                    shardIndex,
+                    primary.nodeId(),
+                    new ArrayList<>(nodeIds.subList(1, nodeIds.size()))));
+        }
+
+        table.setShards(newShards);
+        catalog.bumpRouteVersion();
+        changes.add(table.getTableName() + " shards " + oldShards.size() + " -> " + newShards.size());
+        return changes;
+    }
+
+    private int columnIndex(List<String> columns, String columnName) {
+        for (int i = 0; i < columns.size(); i++) {
+            if (columns.get(i).equalsIgnoreCase(columnName)) {
+                return i;
+            }
+        }
+        throw new IllegalStateException("Partition column not found in shard rows: " + columnName);
+    }
+
     public synchronized boolean needsRebalance() {
-        List<NodeRecord> onlineNodes = onlineNodes();
-        if (onlineNodes.isEmpty() || catalog.clusterMetadata().getTables().isEmpty()) {
+        List<NodeRecord> primaryNodes = primaryNodes();
+        if (primaryNodes.isEmpty() || catalog.clusterMetadata().getTables().isEmpty()) {
             return false;
         }
         for (TableMetadata table : catalog.clusterMetadata().getTables()) {
             for (ShardMetadata shard : table.getShards()) {
                 List<String> current = shardNodeIds(shard);
-                int copyCount = Math.min(Math.max(1, current.size()), onlineNodes.size());
-                if (!current.equals(desiredNodeIds(shard.getShardIndex(), copyCount, onlineNodes))) {
+                if (!current.equals(desiredNodeIds(shard.getShardIndex(), primaryNodes, Set.of()))) {
                     return true;
                 }
             }
@@ -113,10 +237,31 @@ public class ClusterRebalancer {
         return nodes;
     }
 
-    private List<String> desiredNodeIds(int shardIndex, int copyCount, List<NodeRecord> onlineNodes) {
+    private List<NodeRecord> primaryNodes() {
+        return primaryNodes(Set.of());
+    }
+
+    private List<NodeRecord> primaryNodes(Set<String> excludedNodeIds) {
+        return dataNodes.values().stream()
+                .filter(NodeRecord::isAvailable)
+                .filter(node -> node.role() == ReplicaRole.PRIMARY)
+                .filter(node -> !containsIgnoreCase(excludedNodeIds, node.nodeId()))
+                .sorted(Comparator.comparing(NodeRecord::nodeId))
+                .toList();
+    }
+
+    private boolean containsIgnoreCase(Set<String> values, String value) {
+        return values.stream().anyMatch(item -> item.equalsIgnoreCase(value));
+    }
+
+    private List<String> desiredNodeIds(int shardIndex, List<NodeRecord> primaryNodes, Set<String> excludedNodeIds) {
         List<String> ids = new ArrayList<>();
-        for (int i = 0; i < copyCount; i++) {
-            ids.add(onlineNodes.get((shardIndex + i) % onlineNodes.size()).nodeId());
+        NodeRecord primary = primaryNodes.get(shardIndex % primaryNodes.size());
+        ids.add(primary.nodeId());
+        if (primary.partnerNodeId() != null
+                && !containsIgnoreCase(excludedNodeIds, primary.partnerNodeId())
+                && isAvailable(primary.partnerNodeId())) {
+            ids.add(primary.partnerNodeId());
         }
         return ids;
     }
@@ -128,10 +273,119 @@ public class ClusterRebalancer {
         return ids;
     }
 
-    private NodeRecord sourceNode(List<String> nodeIds) {
+    private void cleanupStaleShards() {
+        Map<String, Set<String>> expectedByNode = expectedShardsByNode();
+        for (NodeRecord node : dataNodes.values()) {
+            if (!node.isAvailable()) {
+                continue;
+            }
+            Set<String> expected = expectedByNode.getOrDefault(node.nodeId(), Set.of());
+            for (String shardName : listManagedPhysicalShardTables(node)) {
+                if (!expected.contains(shardName)) {
+                    dropShard(node, shardName);
+                }
+            }
+        }
+    }
+
+    private Map<String, Set<String>> expectedShardsByNode() {
+        Map<String, Set<String>> expected = new HashMap<>();
+        for (TableMetadata table : catalog.clusterMetadata().getTables()) {
+            for (ShardMetadata shard : table.getShards()) {
+                expected.computeIfAbsent(shard.getPrimaryNodeId(), ignored -> new HashSet<>()).add(shard.getShardName());
+                for (String replica : shard.getReplicaNodeIds()) {
+                    expected.computeIfAbsent(replica, ignored -> new HashSet<>()).add(shard.getShardName());
+                }
+            }
+        }
+        return expected;
+    }
+
+    private Set<String> allShardNames() {
+        Set<String> names = new HashSet<>();
+        for (TableMetadata table : catalog.clusterMetadata().getTables()) {
+            for (ShardMetadata shard : table.getShards()) {
+                names.add(shard.getShardName());
+            }
+        }
+        return names;
+    }
+
+    private List<String> listManagedPhysicalShardTables(NodeRecord node) {
+        RemoteSqlResult result = execute(node, tableListSql(node.databaseType()));
+        if (!result.success()) {
+            return List.of();
+        }
+        List<String> shardTables = new ArrayList<>();
+        for (List<Object> row : result.rows()) {
+            if (row.isEmpty()) {
+                continue;
+            }
+            String tableName = String.valueOf(row.get(0));
+            if (isManagedShardTable(tableName)) {
+                shardTables.add(tableName);
+            }
+        }
+        return shardTables;
+    }
+
+    private boolean isManagedShardTable(String physicalTableName) {
+        for (TableMetadata table : catalog.clusterMetadata().getTables()) {
+            String prefix = table.getTableName() + "_";
+            if (!physicalTableName.regionMatches(true, 0, prefix, 0, prefix.length())) {
+                continue;
+            }
+            String suffix = physicalTableName.substring(prefix.length());
+            if (!suffix.isBlank() && suffix.chars().allMatch(Character::isDigit)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private List<String> listPhysicalShardTables(NodeRecord node, Set<String> knownShardNames) {
+        if (knownShardNames.isEmpty()) {
+            return List.of();
+        }
+        RemoteSqlResult result = execute(node, tableListSql(node.databaseType()));
+        if (!result.success()) {
+            return List.of();
+        }
+        List<String> shardTables = new ArrayList<>();
+        for (List<Object> row : result.rows()) {
+            if (row.isEmpty()) {
+                continue;
+            }
+            String tableName = String.valueOf(row.get(0));
+            for (String shardName : knownShardNames) {
+                if (tableName.equalsIgnoreCase(shardName)) {
+                    shardTables.add(shardName);
+                    break;
+                }
+            }
+        }
+        return shardTables;
+    }
+
+    private boolean hasPhysicalShard(NodeRecord node, String shardName) {
+        return listPhysicalShardTables(node, Set.of(shardName)).stream()
+                .anyMatch(table -> table.equalsIgnoreCase(shardName));
+    }
+
+    private String tableListSql(DatabaseType databaseType) {
+        if (databaseType == DatabaseType.MYSQL) {
+            return "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE();";
+        }
+        if (databaseType == DatabaseType.POSTGRESQL) {
+            return "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public';";
+        }
+        return "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = 'PUBLIC';";
+    }
+
+    private NodeRecord sourceNode(List<String> nodeIds, String shardName) {
         for (String nodeId : nodeIds) {
             NodeRecord node = dataNodes.get(nodeId);
-            if (node != null && node.isAvailable()) {
+            if (node != null && node.isAvailable() && hasPhysicalShard(node, shardName)) {
                 return node;
             }
         }
@@ -182,7 +436,9 @@ public class ClusterRebalancer {
     private void executeRequired(NodeRecord node, String sql) {
         RemoteSqlResult result = execute(node, sql);
         if (!result.success()) {
-            throw new IllegalStateException("Rebalance SQL failed on " + node.nodeId() + ": " + result.error());
+            String error = result.error() == null || result.error().isBlank() ? "(no error message)" : result.error();
+            throw new IllegalStateException("Rebalance SQL failed on " + node.nodeId()
+                    + ": " + error + " SQL=[" + sql + "]");
         }
     }
 

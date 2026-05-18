@@ -24,6 +24,11 @@ public class ClusterMetadata implements Serializable {
         return this;
     }
 
+    public ClusterMetadata removeNode(String nodeId) {
+        nodes.remove(nodeId.toLowerCase());
+        return this;
+    }
+
     public DataNodeMetadata getNode(String nodeId) {
         return nodes.get(nodeId.toLowerCase());
     }
