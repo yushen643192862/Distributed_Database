@@ -51,6 +51,9 @@ docker-compose.yml  本地容器化启动 1 master + 多个 datanode
 
 ```sql
 CREATE TABLE table_name (...) SHARD BY HASH(column) SHARDS n REPLICAS r;
+CREATE INDEX index_name ON table_name(column);
+CREATE UNIQUE INDEX index_name ON table_name(column1, column2);
+DROP INDEX index_name ON table_name;
 DROP TABLE table_name;
 INSERT INTO table_name VALUES (...);
 DELETE FROM table_name WHERE column = value;
@@ -63,6 +66,8 @@ FROM left_table JOIN right_table ON left_table.column = right_table.column;
 SHOW NODES;
 SHOW SHARDS;
 SHOW SHARDS table_name;
+SHOW INDEXES;
+SHOW INDEXES table_name;
 SHOW TABLES;
 SHOW CLUSTER;
 FAIL NODE dn1;
@@ -75,6 +80,7 @@ REBALANCE CLUSTER;
 
 - `SHOW NODES` 查看节点在线状态、角色、partner、读写计数。
 - `SHOW SHARDS` 查看 master 的路由元数据。
+- `SHOW INDEXES` 查看逻辑索引元数据；每个逻辑索引会在各个物理 shard 表上创建一个本地 B+Tree/B-tree 索引。
 - `SHOW TABLES` 查看 datanode 上真实存在的物理分片表。
 - `REBALANCE CLUSTER` 当前主要用于修复物理表和清理过期分片，不强制改变分片数量。
 
@@ -237,6 +243,8 @@ INSERT INTO student VALUES (1003, 'Cindy', 22, 'CS');
 INSERT INTO student VALUES (1004, 'David', 19, 'SE');
 INSERT INTO student VALUES (1005, 'Eva', 23, 'AI');
 INSERT INTO student VALUES (1006, 'Frank', 20, 'Security');
+CREATE INDEX idx_student_name ON student(name);
+SHOW INDEXES student;
 ```
 
 ### course 表
@@ -264,6 +272,25 @@ SHOW NODES;
 SHOW SHARDS student;
 SHOW SHARDS course;
 SHOW TABLES;
+```
+
+删改测试：
+
+```sql
+UPDATE student SET age = 24 WHERE sid = 1005;
+UPDATE student SET dept = 'Software' WHERE sid = 1004;
+UPDATE course SET credit = 5 WHERE cid = 1;
+
+SELECT * FROM student WHERE sid = 1005;
+SELECT * FROM student WHERE sid = 1004;
+SELECT * FROM course WHERE cid = 1;
+
+DELETE FROM course WHERE cid = 6;
+DELETE FROM student WHERE sid = 1006;
+
+SELECT * FROM course WHERE cid = 6;
+SELECT * FROM student WHERE sid = 1006;
+SELECT student.name, course.cname FROM student JOIN course ON student.sid = course.sid;
 ```
 
 ## 数据文件

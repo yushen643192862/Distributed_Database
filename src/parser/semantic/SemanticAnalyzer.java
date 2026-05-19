@@ -35,6 +35,8 @@ public class SemanticAnalyzer {
             analyzeAlterTable(statement);
         } else if ("TruncateTableStatement".equals(nodeName)) {
             analyzeTableExists((String) get(statement, "tableName"));
+        } else if ("Index".equals(nodeName)) {
+            analyzeIndex(statement);
         } else {
             throw new SemanticException("Unsupported statement: " + nodeName);
         }
@@ -171,6 +173,27 @@ public class SemanticAnalyzer {
                 }
             } else if ("DROP".equals(actionType)) {
                 ensureColumnExists(table, (String) get(action, "columnName"));
+            }
+        }
+    }
+
+    private void analyzeIndex(Object statement) {
+        boolean drop = Boolean.TRUE.equals(get(statement, "drop"));
+        String tableName = (String) get(statement, "tableName");
+        if (drop && (tableName == null || tableName.isBlank())) {
+            return;
+        }
+        TableSchema table = analyzeTableExists(tableName);
+        if (!drop) {
+            List<?> columns = list(get(statement, "columns"));
+            if (columns.isEmpty()) {
+                throw new SemanticException("CREATE INDEX needs at least one column");
+            }
+            Set<String> seen = new HashSet<>();
+            for (Object column : columns) {
+                String columnName = String.valueOf(column);
+                ensureColumnExists(table, columnName);
+                ensureUnique(seen, columnName, "Duplicate index column: " + columnName);
             }
         }
     }

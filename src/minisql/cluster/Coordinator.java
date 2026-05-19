@@ -19,6 +19,7 @@ import parser.parser.DeleteStatement;
 import parser.parser.DropTableStatement;
 import parser.parser.IdentifierExpression;
 import parser.parser.InsertStatement;
+import parser.parser.Index;
 import parser.parser.JoinClause;
 import parser.parser.Parser;
 import parser.parser.SelectStatement;
@@ -71,6 +72,12 @@ public class Coordinator {
         }
         if (upper.startsWith("SHOW SHARDS ")) {
             return QueryResult.message(catalog.describeShards(normalized.substring("SHOW SHARDS ".length()).trim()));
+        }
+        if (upper.equals("SHOW INDEXES")) {
+            return QueryResult.message(catalog.describeIndexes(null));
+        }
+        if (upper.startsWith("SHOW INDEXES ")) {
+            return QueryResult.message(catalog.describeIndexes(normalized.substring("SHOW INDEXES ".length()).trim()));
         }
         if (upper.startsWith("FAIL NODE ")) {
             return failNode(normalized.substring("FAIL NODE ".length()).trim());
@@ -706,6 +713,8 @@ public class Coordinator {
             names.add(alter.tableName);
         } else if (statement instanceof TruncateTableStatement truncate) {
             names.add(truncate.tableName);
+        } else if (statement instanceof Index index && index.tableName != null && !index.tableName.isBlank()) {
+            names.add(index.tableName);
         }
         return names;
     }

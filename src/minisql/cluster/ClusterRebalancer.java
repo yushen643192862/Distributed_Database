@@ -6,6 +6,7 @@ import minisql.cluster.planner.RuntimeCatalog;
 import parser.semantic.ColumnSchema;
 import parser.semantic.TableSchema;
 import physical.DatabaseType;
+import physical.IndexMetadata;
 import physical.RemoteExecutionRequest;
 import physical.ShardMetadata;
 import physical.TableMetadata;
@@ -178,6 +179,7 @@ public class ClusterRebalancer {
                 if (!rows.isEmpty()) {
                     executeRequired(target, insertSql(shardName, columns, rows, target.databaseType()));
                 }
+                createIndexes(target, table, shardName);
             }
             newShards.add(new ShardMetadata(
                     shardName,
@@ -417,6 +419,10 @@ public class ClusterRebalancer {
         if (!sourceRows.rows().isEmpty()) {
             executeRequired(target, insertSql(shardName, sourceRows.columns(), sourceRows.rows(), target.databaseType()));
         }
+        TableMetadata table = catalog.clusterMetadata().getTable(schema.getName());
+        if (table != null) {
+            createIndexes(target, table, shardName);
+        }
     }
 
     private void dropShard(NodeRecord node, String shardName) {
@@ -467,6 +473,19 @@ public class ClusterRebalancer {
         return "INSERT INTO " + quote(shardName, databaseType)
                 + " (" + joinIdentifiers(columns, databaseType) + ") VALUES "
                 + String.join(", ", rowValues) + ";";
+    }
+
+    private void createIndexes(NodeRecord target, TableMetadata table, String shardName) {
+        for (IndexMetadata index : table.getIndexes()) {
+            executeRequired(target, createIndexSql(index, shardName, target.databaseType()));
+        }
+    }
+
+    private String createIndexSql(IndexMetadata index, String shardName, DatabaseType databaseType) {
+        return "CREATE " + (index.isUnique() ? "UNIQUE " : "") + "INDEX IF NOT EXISTS "
+                + quote(index.getIndexName() + "_" + shardName, databaseType)
+                + " ON " + quote(shardName, databaseType)
+                + " (" + joinIdentifiers(index.getColumns(), databaseType) + ");";
     }
 
     private String joinIdentifiers(List<String> columns, DatabaseType databaseType) {

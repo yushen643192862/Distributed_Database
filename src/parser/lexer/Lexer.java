@@ -27,6 +27,7 @@ public class Lexer {
         KEYWORDS.put("alter", tokenType.ALTER);
         KEYWORDS.put("truncate", tokenType.TRUNCATE);
         KEYWORDS.put("table", tokenType.TABLE);
+        KEYWORDS.put("index", tokenType.INDEX);
         KEYWORDS.put("from", tokenType.FROM);
         KEYWORDS.put("where", tokenType.WHERE);
         KEYWORDS.put("set", tokenType.SET);

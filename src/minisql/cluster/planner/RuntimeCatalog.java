@@ -12,6 +12,7 @@ import parser.semantic.SchemaCatalog;
 import physical.ClusterMetadata;
 import physical.DataNodeMetadata;
 import physical.DatabaseType;
+import physical.IndexMetadata;
 import physical.ShardMetadata;
 import physical.TableMetadata;
 
@@ -122,6 +123,51 @@ public class RuntimeCatalog implements Serializable {
         schemaCatalog.removeTable(tableName);
         clusterMetadata.removeTable(tableName);
         routeVersion++;
+    }
+
+    public void registerIndex(parser.parser.Index index) {
+        TableMetadata table = requireTable(index.tableName);
+        if (table.hasIndex(index.indexName)) {
+            throw new IllegalArgumentException("Index already exists: " + index.indexName);
+        }
+        table.addIndex(new IndexMetadata(index.indexName, index.tableName, index.columns, index.unique));
+        routeVersion++;
+    }
+
+    public void dropIndex(parser.parser.Index index) {
+        TableMetadata table = index.tableName == null || index.tableName.isBlank()
+                ? tableContainingIndex(index.indexName)
+                : requireTable(index.tableName);
+        if (table == null) {
+            if (index.ifExists) {
+                return;
+            }
+            throw new IllegalArgumentException("Unknown index: " + index.indexName);
+        }
+        boolean removed = table.dropIndex(index.indexName);
+        if (!removed && !index.ifExists) {
+            throw new IllegalArgumentException("Unknown index: " + index.indexName);
+        }
+        if (removed) {
+            routeVersion++;
+        }
+    }
+
+    public TableMetadata tableContainingIndex(String indexName) {
+        for (TableMetadata table : clusterMetadata.getTables()) {
+            if (table.hasIndex(indexName)) {
+                return table;
+            }
+        }
+        return null;
+    }
+
+    private TableMetadata requireTable(String tableName) {
+        TableMetadata table = clusterMetadata.getTable(tableName);
+        if (table == null) {
+            throw new IllegalArgumentException("Unknown table: " + tableName);
+        }
+        return table;
     }
 
     public void applyAlterTable(AlterTableStatement statement) {
@@ -262,6 +308,36 @@ public class RuntimeCatalog implements Serializable {
         }
         if (builder.isEmpty() && tableName != null) {
             throw new IllegalArgumentException("Unknown table: " + tableName);
+        }
+        return builder.toString().stripTrailing();
+    }
+
+    public String describeIndexes(String tableName) {
+        StringBuilder builder = new StringBuilder();
+        for (TableMetadata table : clusterMetadata.getTables()) {
+            if (tableName != null && !table.getTableName().equalsIgnoreCase(tableName)) {
+                continue;
+            }
+            if (table.getIndexes().isEmpty()) {
+                continue;
+            }
+            builder.append(table.getTableName()).append(System.lineSeparator());
+            for (IndexMetadata index : table.getIndexes()) {
+                builder.append("  ")
+                        .append(index.getIndexName())
+                        .append(" type=BPTREE")
+                        .append(" unique=")
+                        .append(index.isUnique())
+                        .append(" columns=")
+                        .append(index.getColumns())
+                        .append(System.lineSeparator());
+            }
+        }
+        if (builder.isEmpty()) {
+            if (tableName != null && clusterMetadata.getTable(tableName) == null) {
+                throw new IllegalArgumentException("Unknown table: " + tableName);
+            }
+            return "No indexes.";
         }
         return builder.toString().stripTrailing();
     }

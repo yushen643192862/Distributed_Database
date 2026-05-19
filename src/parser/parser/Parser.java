@@ -36,10 +36,10 @@ public class Parser {
                 statement = parseDelete();
                 break;
             case CREATE:
-                statement = parseCreateTable();
+                statement = parseCreate();
                 break;
             case DROP:
-                statement = parseDropTable();
+                statement = parseDrop();
                 break;
             case ALTER:
                 statement = parseAlterTable();
@@ -150,8 +150,25 @@ public class Parser {
         return statement;
     }
 
-    private CreateTableStatement parseCreateTable() {
+    private ASTNode parseCreate() {
         expect(tokenType.CREATE);
+        if (currentToken.type == tokenType.TABLE) {
+            return parseCreateTableAfterCreate();
+        }
+        boolean unique = match(tokenType.UNIQUE);
+        expect(tokenType.INDEX);
+        Index index = new Index();
+        index.unique = unique;
+        index.indexName = parseName();
+        expect(tokenType.ON);
+        index.tableName = parseName();
+        expect(tokenType.LPAREN);
+        index.columns = parseNameList();
+        expect(tokenType.RPAREN);
+        return index;
+    }
+
+    private CreateTableStatement parseCreateTableAfterCreate() {
         expect(tokenType.TABLE);
 
         CreateTableStatement statement = new CreateTableStatement();
@@ -172,8 +189,22 @@ public class Parser {
         return statement;
     }
 
-    private DropTableStatement parseDropTable() {
+    private ASTNode parseDrop() {
         expect(tokenType.DROP);
+        if (currentToken.type == tokenType.INDEX) {
+            expect(tokenType.INDEX);
+            Index index = new Index();
+            index.drop = true;
+            if (match(tokenType.IF)) {
+                expect(tokenType.EXISTS);
+                index.ifExists = true;
+            }
+            index.indexName = parseName();
+            if (match(tokenType.ON)) {
+                index.tableName = parseName();
+            }
+            return index;
+        }
         expect(tokenType.TABLE);
 
         DropTableStatement statement = new DropTableStatement();

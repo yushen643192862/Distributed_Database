@@ -7,4 +7,6 @@ public class Index extends ASTNode {
     public String tableName;
     public List<String> columns;
     public boolean unique;
+    public boolean drop;
+    public boolean ifExists;
 }

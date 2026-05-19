@@ -8,6 +8,7 @@ public class TableMetadata implements Serializable {
     private final String tableName;
     private final String partitionKey;
     private final List<ShardMetadata> shards = new ArrayList<>();
+    private final List<IndexMetadata> indexes = new ArrayList<>();
 
     public TableMetadata(String tableName, String partitionKey) {
         this.tableName = tableName;
@@ -29,6 +30,31 @@ public class TableMetadata implements Serializable {
 
     public List<ShardMetadata> getShards() {
         return shards;
+    }
+
+    public List<IndexMetadata> getIndexes() {
+        return indexes;
+    }
+
+    public TableMetadata addIndex(IndexMetadata index) {
+        dropIndex(index.getIndexName());
+        indexes.add(index);
+        return this;
+    }
+
+    public boolean hasIndex(String indexName) {
+        return indexes.stream().anyMatch(index -> index.getIndexName().equalsIgnoreCase(indexName));
+    }
+
+    public IndexMetadata getIndex(String indexName) {
+        return indexes.stream()
+                .filter(index -> index.getIndexName().equalsIgnoreCase(indexName))
+                .findFirst()
+                .orElse(null);
+    }
+
+    public boolean dropIndex(String indexName) {
+        return indexes.removeIf(index -> index.getIndexName().equalsIgnoreCase(indexName));
     }
 
     public TableMetadata setShards(List<ShardMetadata> replacements) {
