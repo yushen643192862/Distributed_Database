@@ -20,6 +20,9 @@ import java.util.LinkedHashMap;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class MasterRpcServer {
     private final RuntimeCatalog catalog;
@@ -29,6 +32,8 @@ public class MasterRpcServer {
     private final ClusterRebalancer rebalancer;
     private final Runnable stateSaver;
     private final int targetPrimaryCount;
+    private final ExecutorService maintenanceExecutor = Executors.newSingleThreadExecutor();
+    private final AtomicBoolean maintenanceQueued = new AtomicBoolean(false);
     private HttpServer server;
 
     public MasterRpcServer(RuntimeCatalog catalog, Map<String, NodeRecord> dataNodes,
@@ -91,18 +96,20 @@ public class MasterRpcServer {
         }
         String host = string(params, "host");
         int port = integer(params, "port");
-        String nodeId = assignNodeId(requestedNodeId, host, port);
-        boolean generated = requestedNodeId == null || requestedNodeId.isBlank();
+        String nodeId = requireRequestedNodeId(requestedNodeId);
         DatabaseType databaseType = DatabaseType.valueOf(string(params, "databaseType").toUpperCase());
 
-        NodeRecord node = dataNodes.computeIfAbsent(nodeId, NodeRecord::new);
+        NodeRecord node;
+        synchronized (dataNodes) {
+            node = dataNodes.computeIfAbsent(nodeId, NodeRecord::new);
+        }
         ReplicaRole oldRole = node.role();
         boolean wasKnown = oldRole != null;
         if (node.administrativelyFailed()) {
             node.updateEndpoint(host, port, databaseType);
             catalog.upsertNode(nodeId, host, port, databaseType, false);
             saveState();
-            return registrationResult(nodeId, generated);
+            return registrationResult(nodeId);
         }
         node.register(host, port, databaseType);
         RegistrationAction action = assignRoleOnRegistration(node, optionalString(params, "role"));
@@ -113,22 +120,47 @@ public class MasterRpcServer {
             catalog.attachReplicaToPrimary(node.partnerNodeId(), node.nodeId());
         }
         catalog.upsertNode(nodeId, host, port, databaseType, true);
-        if (action == RegistrationAction.REHASH || (oldRole != node.role() && node.role() == ReplicaRole.PRIMARY)) {
-            rebalancer.rebalance();
-        } else if (action == RegistrationAction.REPAIR || wasKnown || node.role() == ReplicaRole.REPLICA) {
-            rebalancer.repair();
-        }
         saveState();
+        scheduleMaintenance(action, oldRole, node.role(), wasKnown);
 
-        return registrationResult(nodeId, generated);
+        return registrationResult(nodeId);
     }
 
-    private Map<String, Object> registrationResult(String nodeId, boolean generated) {
+    private void scheduleMaintenance(RegistrationAction action, ReplicaRole oldRole, ReplicaRole newRole, boolean wasKnown) {
+        boolean needsRebalance = action == RegistrationAction.REHASH
+                || oldRole != newRole && newRole == ReplicaRole.PRIMARY;
+        boolean needsRepair = action == RegistrationAction.REPAIR
+                || wasKnown
+                || newRole == ReplicaRole.REPLICA;
+        if (!needsRebalance && !needsRepair) {
+            return;
+        }
+        if (!maintenanceQueued.compareAndSet(false, true)) {
+            return;
+        }
+        maintenanceExecutor.submit(() -> {
+            try {
+                if (rebalancer.needsRebalance()) {
+                    rebalancer.rebalance();
+                } else {
+                    rebalancer.repair();
+                }
+                saveState();
+            } catch (RuntimeException ex) {
+                System.err.println("Cluster maintenance failed: " + ex.getMessage());
+                ex.printStackTrace(System.err);
+            } finally {
+                maintenanceQueued.set(false);
+            }
+        });
+    }
+
+    private Map<String, Object> registrationResult(String nodeId) {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("accepted", true);
         result.put("nodeId", nodeId);
         result.put("assignedNodeId", nodeId);
-        result.put("generated", generated);
+        result.put("generated", false);
         return result;
     }
 
@@ -267,7 +299,10 @@ public class MasterRpcServer {
 
     private Map<String, Object> heartbeat(Map<String, Object> params) {
         String nodeId = string(params, "nodeId");
-        NodeRecord node = dataNodes.computeIfAbsent(nodeId, NodeRecord::new);
+        NodeRecord node = dataNodes.get(nodeId);
+        if (node == null) {
+            throw new IllegalArgumentException("Heartbeat from unregistered DataNode: " + nodeId);
+        }
         NodeStatus status = NodeStatus.valueOf(string(params, "status").toUpperCase());
         String host = optionalString(params, "host");
         String portValue = optionalString(params, "port");
@@ -329,25 +364,11 @@ public class MasterRpcServer {
         }
     }
 
-    private String assignNodeId(String requestedNodeId, String host, int port) {
+    private String requireRequestedNodeId(String requestedNodeId) {
         if (requestedNodeId != null && !requestedNodeId.isBlank()) {
             return requestedNodeId.trim();
         }
-        for (NodeRecord node : dataNodes.values()) {
-            if (host.equalsIgnoreCase(node.host()) && port == node.port()) {
-                return node.nodeId();
-            }
-        }
-        for (NodeRecord node : dataNodes.values()) {
-            if (node.lastHeartbeatEpochMs() <= 0 && !node.isAvailable()) {
-                return node.nodeId();
-            }
-        }
-        int next = 1;
-        while (dataNodes.containsKey("dn" + next)) {
-            next++;
-        }
-        return "dn" + next;
+        throw new IllegalArgumentException("DataNode must specify MINISQL_NODE_ID or --node; master no longer auto-assigns node ids");
     }
 
     private String read(InputStream in) throws IOException {

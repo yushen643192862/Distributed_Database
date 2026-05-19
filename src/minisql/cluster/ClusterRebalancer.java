@@ -210,6 +210,9 @@ public class ClusterRebalancer {
             return false;
         }
         for (TableMetadata table : catalog.clusterMetadata().getTables()) {
+            if (table.getShards().size() != primaryNodes.size()) {
+                return true;
+            }
             for (ShardMetadata shard : table.getShards()) {
                 List<String> current = shardNodeIds(shard);
                 if (!current.equals(desiredNodeIds(shard.getShardIndex(), primaryNodes, Set.of()))) {
@@ -230,7 +233,7 @@ public class ClusterRebalancer {
 
     private List<NodeRecord> onlineNodes() {
         List<NodeRecord> nodes = new ArrayList<>();
-        for (NodeRecord node : dataNodes.values()) {
+        for (NodeRecord node : nodeSnapshot()) {
             if (node.isAvailable()) {
                 nodes.add(node);
             }
@@ -244,7 +247,7 @@ public class ClusterRebalancer {
     }
 
     private List<NodeRecord> primaryNodes(Set<String> excludedNodeIds) {
-        return dataNodes.values().stream()
+        return nodeSnapshot().stream()
                 .filter(NodeRecord::isAvailable)
                 .filter(node -> node.role() == ReplicaRole.PRIMARY)
                 .filter(node -> !containsIgnoreCase(excludedNodeIds, node.nodeId()))
@@ -277,7 +280,7 @@ public class ClusterRebalancer {
 
     private void cleanupStaleShards() {
         Map<String, Set<String>> expectedByNode = expectedShardsByNode();
-        for (NodeRecord node : dataNodes.values()) {
+        for (NodeRecord node : nodeSnapshot()) {
             if (!node.isAvailable()) {
                 continue;
             }
@@ -405,6 +408,12 @@ public class ClusterRebalancer {
             throw new IllegalStateException("Unknown DataNode during rebalance: " + nodeId);
         }
         return node;
+    }
+
+    private List<NodeRecord> nodeSnapshot() {
+        synchronized (dataNodes) {
+            return new ArrayList<>(dataNodes.values());
+        }
     }
 
     private void copyShard(NodeRecord source, NodeRecord target, TableSchema schema, String shardName) {

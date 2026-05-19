@@ -44,6 +44,7 @@ public class SqlPlanningModule {
     public PlannedSql plan(String sql, Collection<NodeRecord> nodes) {
         PreparedSql prepared = prepare(sql, nodes.size());
         ASTNode ast = new Parser(prepared.sql()).parseStatement();
+        NonDeterministicFunctionFolder.fold(ast);
 
         new SemanticAnalyzer(catalog.schemaCatalog()).analyze(ast);
         if (ast instanceof Index index) {

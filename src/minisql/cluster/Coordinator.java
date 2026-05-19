@@ -91,6 +91,9 @@ public class Coordinator {
         if (upper.equals("REBALANCE CLUSTER")) {
             return rebalanceCluster();
         }
+        if (upper.equals("RESHARD CLUSTER")) {
+            return reshardCluster();
+        }
 
         QueryResult coordinatorJoin = tryExecuteCoordinatorJoin(sql);
         if (coordinatorJoin != null) {
@@ -320,6 +323,14 @@ public class Coordinator {
             return QueryResult.message("Cluster repaired.");
         }
         return QueryResult.message("Cluster repaired:" + System.lineSeparator() + String.join(System.lineSeparator(), changes));
+    }
+
+    private QueryResult reshardCluster() {
+        List<String> changes = rebalancer.rebalance();
+        if (changes.isEmpty()) {
+            return QueryResult.message("Cluster reshard checked; no changes.");
+        }
+        return QueryResult.message("Cluster resharded:" + System.lineSeparator() + String.join(System.lineSeparator(), changes));
     }
 
     private QueryResult tryExecuteCoordinatorJoin(String sql) {

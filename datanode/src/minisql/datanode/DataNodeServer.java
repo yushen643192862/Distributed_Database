@@ -40,6 +40,8 @@ public class DataNodeServer {
 
     public void start() {
         try {
+            DatabaseInitializer.ensureDatabase(config);
+
             HttpServer server = HttpServer.create(new InetSocketAddress(config.port()), 0);
             server.createContext("/rpc", this::handleRpc);
             server.setExecutor(Executors.newCachedThreadPool());

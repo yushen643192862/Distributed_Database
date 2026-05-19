@@ -55,12 +55,6 @@ public class MiniSqlSystem {
 
         RuntimeCatalog catalog = new RuntimeCatalog();
         Map<String, NodeRecord> dataNodes = new LinkedHashMap<>();
-        dataNodes.put("dn1", new NodeRecord("dn1"));
-        dataNodes.put("dn2", new NodeRecord("dn2"));
-        dataNodes.put("dn3", new NodeRecord("dn3"));
-        for (String nodeId : dataNodes.keySet()) {
-            catalog.addNode(nodeId);
-        }
 
         return new MiniSqlSystem(catalog, dataNodes, persistencePath);
     }
