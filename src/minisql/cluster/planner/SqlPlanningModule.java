@@ -66,7 +66,7 @@ public class SqlPlanningModule {
         logicalPlan = new PredicatePushdown().optimize(logicalPlan);
         logicalPlan = new ColumnPruning().optimize(logicalPlan);
 
-        PhysicalPlan physicalPlan = new PhysicalPlanBuilder(catalog.clusterMetadata()).build(logicalPlan);
+        PhysicalPlan physicalPlan = new PhysicalPlanBuilder(catalog.clusterMetadata(), nodes).build(logicalPlan);
         List<RemoteExecutionRequest> requests = new RemoteExecutionRequestBuilder(catalog.clusterMetadata()).build(physicalPlan);
 
         return new PlannedSql(requests, ast);

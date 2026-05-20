@@ -1,5 +1,6 @@
 package physical;
 
+import minisql.cluster.node.NodeRecord;
 import parser.lexer.tokenType;
 import parser.parser.ASTNode;
 import parser.parser.Condition;
@@ -9,16 +10,29 @@ import parser.parser.LiteralExpression;
 
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 public class PhysicalPlanBuilder {
     private final ClusterMetadata metadata;
+    private final Map<String, Long> readScores;
 
     public PhysicalPlanBuilder(ClusterMetadata metadata) {
+        this(metadata, List.of());
+    }
+
+    public PhysicalPlanBuilder(ClusterMetadata metadata, Collection<NodeRecord> nodes) {
         this.metadata = metadata;
+        this.readScores = new HashMap<>();
+        for (NodeRecord node : nodes) {
+            if (node.isAvailable()) {
+                readScores.put(node.nodeId().toLowerCase(), node.readRequests());
+            }
+        }
     }
 
     public PhysicalPlan build(Object logicalPlan) {
@@ -115,7 +129,7 @@ public class PhysicalPlanBuilder {
         List<PhysicalPlan> scans = new ArrayList<>();
         List<String> columns = stringList(call(scanPlan, "getRequiredColumns"));
         for (ShardMetadata shard : shards) {
-            scans.add(new RemoteScanPlan(shard.getPrimaryNodeId(), shard.getShardName(), tableName, columns, filter));
+            scans.add(new RemoteScanPlan(readNodeId(shard), shard.getShardName(), tableName, columns, filter));
         }
         return scans.size() == 1 ? scans.get(0) : new GatherPlan(scans);
     }
@@ -181,6 +195,37 @@ public class PhysicalPlanBuilder {
         }
         nodeIds.addAll(shard.getReplicaNodeIds());
         return nodeIds.stream().filter(this::isAlive).distinct().toList();
+    }
+
+    private String readNodeId(ShardMetadata shard) {
+        String primary = shard.getPrimaryNodeId();
+        String selected = primary;
+        long selectedScore = readScore(primary);
+        if (!isAlive(primary)) {
+            selected = null;
+            selectedScore = Long.MAX_VALUE;
+        }
+
+        for (String replica : shard.getReplicaNodeIds()) {
+            if (!isAlive(replica)) {
+                continue;
+            }
+            long replicaScore = readScore(replica);
+            if (selected == null || replicaScore < selectedScore) {
+                selected = replica;
+                selectedScore = replicaScore;
+            }
+        }
+
+        if (selected == null) {
+            selected = primary;
+        }
+        readScores.merge(selected.toLowerCase(), 1L, Long::sum);
+        return selected;
+    }
+
+    private long readScore(String nodeId) {
+        return readScores.getOrDefault(nodeId.toLowerCase(), 0L);
     }
 
     private boolean isAlive(String nodeId) {

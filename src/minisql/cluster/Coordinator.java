@@ -439,11 +439,14 @@ public class Coordinator {
         if (table == null) {
             throw new IllegalArgumentException("Unknown table metadata: " + tableReference.tableName);
         }
+        Map<String, Long> readScores = readScores();
         List<Map<String, Object>> rows = new ArrayList<>();
         for (ShardMetadata shard : table.getShards()) {
-            NodeRecord node = requireOnlineNode(shard.getPrimaryNodeId());
+            NodeRecord node = chooseReadNode(shard, readScores);
             String sql = "SELECT " + joinQuoted(columns, node.databaseType())
                     + " FROM " + quoteIdentifier(shard.getShardName(), node.databaseType()) + ";";
+            node.recordRemoteRead();
+            readScores.merge(node.nodeId().toLowerCase(Locale.ROOT), 1L, Long::sum);
             RemoteSqlResult result = remoteClient.execute(node, new RemoteExecutionRequest(
                     node.nodeId(), node.host(), node.port(), node.databaseType(), sql));
             if (!result.success()) {
@@ -458,6 +461,47 @@ public class Coordinator {
             }
         }
         return rows;
+    }
+
+    private Map<String, Long> readScores() {
+        Map<String, Long> scores = new HashMap<>();
+        for (NodeRecord node : dataNodes.values()) {
+            if (node.isAvailable()) {
+                scores.put(node.nodeId().toLowerCase(Locale.ROOT), node.readRequests());
+            }
+        }
+        return scores;
+    }
+
+    private NodeRecord chooseReadNode(ShardMetadata shard, Map<String, Long> readScores) {
+        NodeRecord selected = dataNodes.get(shard.getPrimaryNodeId());
+        long selectedScore = selected != null && selected.isAvailable()
+                ? readScore(readScores, selected.nodeId())
+                : Long.MAX_VALUE;
+        if (selected == null || !selected.isAvailable()) {
+            selected = null;
+        }
+
+        for (String replicaNodeId : shard.getReplicaNodeIds()) {
+            NodeRecord replica = dataNodes.get(replicaNodeId);
+            if (replica == null || !replica.isAvailable()) {
+                continue;
+            }
+            long replicaScore = readScore(readScores, replica.nodeId());
+            if (selected == null || replicaScore < selectedScore) {
+                selected = replica;
+                selectedScore = replicaScore;
+            }
+        }
+
+        if (selected == null) {
+            return requireOnlineNode(shard.getPrimaryNodeId());
+        }
+        return selected;
+    }
+
+    private long readScore(Map<String, Long> readScores, String nodeId) {
+        return readScores.getOrDefault(nodeId.toLowerCase(Locale.ROOT), 0L);
     }
 
     private NodeRecord requireOnlineNode(String nodeId) {
