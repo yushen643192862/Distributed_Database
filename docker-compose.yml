@@ -2,15 +2,48 @@ x-datanode-common: &datanode-common
   build:
     context: ./datanode
   image: distributed-minisql-datanode:local
-  depends_on:
-    - master
   environment:
     MINISQL_MASTER_URL: http://master:8080
-    MINISQL_DATABASE_TYPE: H2
-    MINISQL_JDBC_USER: sa
-    MINISQL_JDBC_PASSWORD: ""
+    MINISQL_JDBC_USER: ddb_user
+    MINISQL_JDBC_PASSWORD: db_1234567
 
 services:
+  mysql:
+    image: mysql:8.4
+    container_name: minisql-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root_1234567
+      MYSQL_DATABASE: ddb
+      MYSQL_USER: ddb_user
+      MYSQL_PASSWORD: db_1234567
+    ports:
+      - "13306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./docker/mysql-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot_1234567"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  postgres:
+    image: postgres:16
+    container_name: minisql-postgres
+    environment:
+      POSTGRES_DB: ddb
+      POSTGRES_USER: ddb_user
+      POSTGRES_PASSWORD: db_1234567
+    ports:
+      - "15432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ddb_user -d ddb"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   master:
     build:
       context: .
@@ -19,7 +52,7 @@ services:
     environment:
       MINISQL_SERVER_MODE: "true"
       MINISQL_MASTER_PORT: 8080
-      MINISQL_PRIMARY_COUNT: 3
+      MINISQL_PRIMARY_COUNT: 5
       MINISQL_HEARTBEAT_TIMEOUT_MS: 5000
       MINISQL_DATA: /app/data/minisql-state.bin
     ports:
@@ -27,173 +60,236 @@ services:
     volumes:
       - master-data:/app/data
 
+  web:
+    build:
+      context: ./web-query
+    image: distributed-minisql-web:local
+    container_name: minisql-web
+    depends_on:
+      master:
+        condition: service_started
+    ports:
+      - "5173:80"
+
   dn1:
     <<: *datanode-common
     container_name: minisql-dn1
+    depends_on:
+      master:
+        condition: service_started
+      mysql:
+        condition: service_healthy
     environment:
       MINISQL_MASTER_URL: http://master:8080
-      MINISQL_DATABASE_TYPE: H2
-      MINISQL_JDBC_USER: sa
-      MINISQL_JDBC_PASSWORD: ""
       MINISQL_NODE_ID: dn1
       MINISQL_NODE_HOST: dn1
       MINISQL_NODE_PORT: 9101
-      MINISQL_JDBC_URL: jdbc:h2:/app/data/dn1
-    ports:
-      - "9101:9101"
-    volumes:
-      - dn1-data:/app/data
+      MINISQL_NODE_ROLE: PRIMARY
+      MINISQL_DATABASE_TYPE: MYSQL
+      MINISQL_JDBC_URL: jdbc:mysql://mysql:3306/minisql_dn1?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      MINISQL_JDBC_USER: ddb_user
+      MINISQL_JDBC_PASSWORD: db_1234567
+      MINISQL_JDBC_DRIVER: com.mysql.cj.jdbc.Driver
 
   dn2:
     <<: *datanode-common
     container_name: minisql-dn2
+    depends_on:
+      master:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      dn1:
+        condition: service_started
     environment:
       MINISQL_MASTER_URL: http://master:8080
-      MINISQL_DATABASE_TYPE: H2
-      MINISQL_JDBC_USER: sa
-      MINISQL_JDBC_PASSWORD: ""
       MINISQL_NODE_ID: dn2
       MINISQL_NODE_HOST: dn2
       MINISQL_NODE_PORT: 9101
-      MINISQL_JDBC_URL: jdbc:h2:/app/data/dn2
-    ports:
-      - "9102:9101"
-    volumes:
-      - dn2-data:/app/data
+      MINISQL_NODE_ROLE: REPLICA
+      MINISQL_DATABASE_TYPE: POSTGRESQL
+      MINISQL_JDBC_URL: jdbc:postgresql://postgres:5432/minisql_dn2
+      MINISQL_JDBC_USER: ddb_user
+      MINISQL_JDBC_PASSWORD: db_1234567
+      MINISQL_JDBC_DRIVER: org.postgresql.Driver
 
   dn3:
     <<: *datanode-common
     container_name: minisql-dn3
+    depends_on:
+      master:
+        condition: service_started
+      mysql:
+        condition: service_healthy
+      dn2:
+        condition: service_started
     environment:
       MINISQL_MASTER_URL: http://master:8080
-      MINISQL_DATABASE_TYPE: H2
-      MINISQL_JDBC_USER: sa
-      MINISQL_JDBC_PASSWORD: ""
       MINISQL_NODE_ID: dn3
       MINISQL_NODE_HOST: dn3
       MINISQL_NODE_PORT: 9101
-      MINISQL_JDBC_URL: jdbc:h2:/app/data/dn3
-    ports:
-      - "9103:9101"
-    volumes:
-      - dn3-data:/app/data
+      MINISQL_NODE_ROLE: PRIMARY
+      MINISQL_DATABASE_TYPE: MYSQL
+      MINISQL_JDBC_URL: jdbc:mysql://mysql:3306/minisql_dn3?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      MINISQL_JDBC_USER: ddb_user
+      MINISQL_JDBC_PASSWORD: db_1234567
+      MINISQL_JDBC_DRIVER: com.mysql.cj.jdbc.Driver
 
   dn4:
     <<: *datanode-common
     container_name: minisql-dn4
+    depends_on:
+      master:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      dn3:
+        condition: service_started
     environment:
       MINISQL_MASTER_URL: http://master:8080
-      MINISQL_DATABASE_TYPE: H2
-      MINISQL_JDBC_USER: sa
-      MINISQL_JDBC_PASSWORD: ""
       MINISQL_NODE_ID: dn4
       MINISQL_NODE_HOST: dn4
       MINISQL_NODE_PORT: 9101
-      MINISQL_JDBC_URL: jdbc:h2:/app/data/dn4
-    ports:
-      - "9104:9101"
-    volumes:
-      - dn4-data:/app/data
+      MINISQL_NODE_ROLE: REPLICA
+      MINISQL_DATABASE_TYPE: POSTGRESQL
+      MINISQL_JDBC_URL: jdbc:postgresql://postgres:5432/minisql_dn4
+      MINISQL_JDBC_USER: ddb_user
+      MINISQL_JDBC_PASSWORD: db_1234567
+      MINISQL_JDBC_DRIVER: org.postgresql.Driver
 
   dn5:
     <<: *datanode-common
     container_name: minisql-dn5
+    depends_on:
+      master:
+        condition: service_started
+      mysql:
+        condition: service_healthy
+      dn4:
+        condition: service_started
     environment:
       MINISQL_MASTER_URL: http://master:8080
-      MINISQL_DATABASE_TYPE: H2
-      MINISQL_JDBC_USER: sa
-      MINISQL_JDBC_PASSWORD: ""
       MINISQL_NODE_ID: dn5
       MINISQL_NODE_HOST: dn5
       MINISQL_NODE_PORT: 9101
-      MINISQL_JDBC_URL: jdbc:h2:/app/data/dn5
-    ports:
-      - "9105:9101"
-    volumes:
-      - dn5-data:/app/data
+      MINISQL_NODE_ROLE: PRIMARY
+      MINISQL_DATABASE_TYPE: MYSQL
+      MINISQL_JDBC_URL: jdbc:mysql://mysql:3306/minisql_dn5?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      MINISQL_JDBC_USER: ddb_user
+      MINISQL_JDBC_PASSWORD: db_1234567
+      MINISQL_JDBC_DRIVER: com.mysql.cj.jdbc.Driver
 
   dn6:
     <<: *datanode-common
     container_name: minisql-dn6
+    depends_on:
+      master:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      dn5:
+        condition: service_started
     environment:
       MINISQL_MASTER_URL: http://master:8080
-      MINISQL_DATABASE_TYPE: H2
-      MINISQL_JDBC_USER: sa
-      MINISQL_JDBC_PASSWORD: ""
       MINISQL_NODE_ID: dn6
       MINISQL_NODE_HOST: dn6
       MINISQL_NODE_PORT: 9101
-      MINISQL_JDBC_URL: jdbc:h2:/app/data/dn6
-    ports:
-      - "9106:9101"
-    volumes:
-      - dn6-data:/app/data
+      MINISQL_NODE_ROLE: REPLICA
+      MINISQL_DATABASE_TYPE: POSTGRESQL
+      MINISQL_JDBC_URL: jdbc:postgresql://postgres:5432/minisql_dn6
+      MINISQL_JDBC_USER: ddb_user
+      MINISQL_JDBC_PASSWORD: db_1234567
+      MINISQL_JDBC_DRIVER: org.postgresql.Driver
 
   dn7:
     <<: *datanode-common
     container_name: minisql-dn7
-    profiles:
-      - scale-test
+    depends_on:
+      master:
+        condition: service_started
+      mysql:
+        condition: service_healthy
+      dn6:
+        condition: service_started
     environment:
       MINISQL_MASTER_URL: http://master:8080
-      MINISQL_DATABASE_TYPE: H2
-      MINISQL_JDBC_USER: sa
-      MINISQL_JDBC_PASSWORD: ""
       MINISQL_NODE_ID: dn7
       MINISQL_NODE_HOST: dn7
       MINISQL_NODE_PORT: 9101
-      MINISQL_JDBC_URL: jdbc:h2:/app/data/dn7
-    ports:
-      - "9107:9101"
-    volumes:
-      - dn7-data:/app/data
+      MINISQL_NODE_ROLE: PRIMARY
+      MINISQL_DATABASE_TYPE: MYSQL
+      MINISQL_JDBC_URL: jdbc:mysql://mysql:3306/minisql_dn7?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      MINISQL_JDBC_USER: ddb_user
+      MINISQL_JDBC_PASSWORD: db_1234567
+      MINISQL_JDBC_DRIVER: com.mysql.cj.jdbc.Driver
 
   dn8:
     <<: *datanode-common
     container_name: minisql-dn8
-    profiles:
-      - scale-test
+    depends_on:
+      master:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      dn7:
+        condition: service_started
     environment:
       MINISQL_MASTER_URL: http://master:8080
-      MINISQL_DATABASE_TYPE: H2
-      MINISQL_JDBC_USER: sa
-      MINISQL_JDBC_PASSWORD: ""
       MINISQL_NODE_ID: dn8
       MINISQL_NODE_HOST: dn8
       MINISQL_NODE_PORT: 9101
-      MINISQL_JDBC_URL: jdbc:h2:/app/data/dn8
-    ports:
-      - "9108:9101"
-    volumes:
-      - dn8-data:/app/data
+      MINISQL_NODE_ROLE: REPLICA
+      MINISQL_DATABASE_TYPE: POSTGRESQL
+      MINISQL_JDBC_URL: jdbc:postgresql://postgres:5432/minisql_dn8
+      MINISQL_JDBC_USER: ddb_user
+      MINISQL_JDBC_PASSWORD: db_1234567
+      MINISQL_JDBC_DRIVER: org.postgresql.Driver
 
   dn9:
     <<: *datanode-common
     container_name: minisql-dn9
-    profiles:
-      - scale-test
+    depends_on:
+      master:
+        condition: service_started
+      mysql:
+        condition: service_healthy
+      dn8:
+        condition: service_started
     environment:
       MINISQL_MASTER_URL: http://master:8080
-      MINISQL_DATABASE_TYPE: H2
-      MINISQL_JDBC_USER: sa
-      MINISQL_JDBC_PASSWORD: ""
       MINISQL_NODE_ID: dn9
       MINISQL_NODE_HOST: dn9
       MINISQL_NODE_PORT: 9101
-      MINISQL_JDBC_URL: jdbc:h2:/app/data/dn9
-    ports:
-      - "9109:9101"
-    volumes:
-      - dn9-data:/app/data
+      MINISQL_NODE_ROLE: PRIMARY
+      MINISQL_DATABASE_TYPE: MYSQL
+      MINISQL_JDBC_URL: jdbc:mysql://mysql:3306/minisql_dn9?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      MINISQL_JDBC_USER: ddb_user
+      MINISQL_JDBC_PASSWORD: db_1234567
+      MINISQL_JDBC_DRIVER: com.mysql.cj.jdbc.Driver
+
+  dn10:
+    <<: *datanode-common
+    container_name: minisql-dn10
+    depends_on:
+      master:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      dn9:
+        condition: service_started
+    environment:
+      MINISQL_MASTER_URL: http://master:8080
+      MINISQL_NODE_ID: dn10
+      MINISQL_NODE_HOST: dn10
+      MINISQL_NODE_PORT: 9101
+      MINISQL_NODE_ROLE: REPLICA
+      MINISQL_DATABASE_TYPE: POSTGRESQL
+      MINISQL_JDBC_URL: jdbc:postgresql://postgres:5432/minisql_dn10
+      MINISQL_JDBC_USER: ddb_user
+      MINISQL_JDBC_PASSWORD: db_1234567
+      MINISQL_JDBC_DRIVER: org.postgresql.Driver
 
 volumes:
   master-data:
-  dn1-data:
-  dn2-data:
-  dn3-data:
-  dn4-data:
-  dn5-data:
-  dn6-data:
-  dn7-data:
-  dn8-data:
-  dn9-data:
+  mysql-data:
+  postgres-data:

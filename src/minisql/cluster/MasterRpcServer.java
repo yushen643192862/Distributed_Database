@@ -67,6 +67,11 @@ public class MasterRpcServer {
     }
 
     private void handleRpc(HttpExchange exchange) throws IOException {
+        applyCors(exchange);
+        if ("OPTIONS".equalsIgnoreCase(exchange.getRequestMethod())) {
+            exchange.sendResponseHeaders(204, -1);
+            return;
+        }
         if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
             write(exchange, 405, Json.stringify(RpcMessage.error(405, "POST required", null)));
             return;
@@ -382,6 +387,12 @@ public class MasterRpcServer {
         try (OutputStream out = exchange.getResponseBody()) {
             out.write(bytes);
         }
+    }
+
+    private void applyCors(HttpExchange exchange) {
+        exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+        exchange.getResponseHeaders().set("Access-Control-Allow-Methods", "POST, OPTIONS");
+        exchange.getResponseHeaders().set("Access-Control-Allow-Headers", "Content-Type");
     }
 
     private Map<String, Object> object(Object value) {

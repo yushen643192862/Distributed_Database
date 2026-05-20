@@ -180,6 +180,10 @@ public class SqlPlanningModule {
     }
 
     private String dropIndexSql(String indexName, String shardName, boolean ifExists, DatabaseType databaseType) {
+        if (databaseType == DatabaseType.MYSQL) {
+            return "DROP INDEX " + quote(physicalIndexName(indexName, shardName), databaseType)
+                    + " ON " + quote(shardName, databaseType) + ";";
+        }
         return "DROP INDEX " + (ifExists && databaseType != DatabaseType.MYSQL ? "IF EXISTS " : "")
                 + quote(physicalIndexName(indexName, shardName), databaseType) + ";";
     }

@@ -313,7 +313,7 @@ public class SemanticAnalyzer {
         for (Object column : list(get(statement, "columns"))) {
             Object expression = get(column, "expression");
             for (String identifier : collectIdentifiers(expression, true)) {
-                if (!groupByColumns.contains(identifier)) {
+                if (!groupByColumns.contains(identifier) && !functionallyCoveredByGroupedId(identifier, groupByColumns)) {
                     throw new SemanticException(identifier + " not in GROUP BY");
                 }
             }
@@ -322,11 +322,20 @@ public class SemanticAnalyzer {
         Object havingClause = get(statement, "havingClause");
         if (havingClause != null) {
             for (String identifier : collectIdentifiers(get(havingClause, "condition"), true)) {
-                if (!groupByColumns.contains(identifier)) {
+                if (!groupByColumns.contains(identifier) && !functionallyCoveredByGroupedId(identifier, groupByColumns)) {
                     throw new SemanticException(identifier + " must appear in GROUP BY");
                 }
             }
         }
+    }
+
+    private boolean functionallyCoveredByGroupedId(String identifier, Set<String> groupByColumns) {
+        int dot = identifier.indexOf('.');
+        if (dot <= 0) {
+            return groupByColumns.contains("id");
+        }
+        String qualifier = identifier.substring(0, dot);
+        return groupByColumns.contains(qualifier + ".id");
     }
 
     private Set<String> collectIdentifiers(Object node, boolean skipAggregateArguments) {

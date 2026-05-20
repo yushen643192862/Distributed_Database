@@ -13,14 +13,19 @@ import physical.ShardMetadata;
 import physical.TableMetadata;
 import parser.parser.ASTNode;
 import parser.parser.AlterTableStatement;
+import parser.parser.AggregateExpression;
 import parser.parser.ColumnExpression;
 import parser.parser.CreateTableStatement;
 import parser.parser.DeleteStatement;
 import parser.parser.DropTableStatement;
+import parser.parser.Expression;
+import parser.parser.FunctionCallExpression;
 import parser.parser.IdentifierExpression;
 import parser.parser.InsertStatement;
 import parser.parser.Index;
 import parser.parser.JoinClause;
+import parser.parser.Order;
+import parser.parser.OrderByItem;
 import parser.parser.Parser;
 import parser.parser.SelectStatement;
 import parser.parser.TableReference;
@@ -30,6 +35,7 @@ import parser.semantic.SemanticAnalyzer;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -59,19 +65,19 @@ public class Coordinator {
         String normalized = stripTrailingSemicolon(sql.trim());
         String upper = normalized.toUpperCase(Locale.ROOT);
         if (upper.equals("SHOW NODES")) {
-            return QueryResult.message(describeNodes());
+            return showNodes();
         }
         if (upper.equals("SHOW CLUSTER")) {
-            return QueryResult.message(describeCluster());
+            return showCluster();
         }
         if (upper.equals("SHOW TABLES")) {
             return showTables();
         }
         if (upper.equals("SHOW SHARDS")) {
-            return QueryResult.message(catalog.describeShards(null));
+            return showShards(null);
         }
         if (upper.startsWith("SHOW SHARDS ")) {
-            return QueryResult.message(catalog.describeShards(normalized.substring("SHOW SHARDS ".length()).trim()));
+            return showShards(normalized.substring("SHOW SHARDS ".length()).trim());
         }
         if (upper.equals("SHOW INDEXES")) {
             return QueryResult.message(catalog.describeIndexes(null));
@@ -97,7 +103,8 @@ public class Coordinator {
 
         QueryResult coordinatorJoin = tryExecuteCoordinatorJoin(sql);
         if (coordinatorJoin != null) {
-            return coordinatorJoin;
+            ASTNode parsed = new Parser(sql).parseStatement();
+            return applySelectPostProcessing(coordinatorJoin, parsed);
         }
 
         PlannedSql plannedSql = planner.plan(sql, availableNodes());
@@ -105,8 +112,226 @@ public class Coordinator {
                 tableNames(plannedSql.statement()), requiresWriteLock(plannedSql.statement()))) {
             QueryResult result = dispatch(plannedSql.requests());
             planner.applyPostDispatch(plannedSql);
+            return applySelectPostProcessing(result, plannedSql.statement());
+        }
+    }
+
+    private QueryResult applySelectPostProcessing(QueryResult result, ASTNode statement) {
+        if (!(statement instanceof SelectStatement select)
+                || result.message() != null
+                || result.rows().isEmpty()) {
             return result;
         }
+        List<Map<String, Object>> rows = new ArrayList<>(result.rows());
+        List<String> columns = result.columns();
+        if (requiresAggregation(select)) {
+            QueryResult aggregated = aggregate(select, rows);
+            rows = new ArrayList<>(aggregated.rows());
+            columns = aggregated.columns();
+        }
+        if (select.orderByClause != null
+                && select.orderByClause.items != null
+                && !select.orderByClause.items.isEmpty()) {
+            rows.sort(orderByComparator(select.orderByClause.items));
+        }
+        if (select.limitClause != null && select.limitClause.limit != null) {
+            int offset = select.limitClause.offset == null ? 0 : Math.max(0, select.limitClause.offset);
+            int limit = Math.max(0, select.limitClause.limit);
+            int from = Math.min(offset, rows.size());
+            int to = Math.min(from + limit, rows.size());
+            rows = new ArrayList<>(rows.subList(from, to));
+        }
+        return QueryResult.rows(columns, rows);
+    }
+
+    private boolean requiresAggregation(SelectStatement select) {
+        if (select.groupByClause != null
+                && select.groupByClause.expressions != null
+                && !select.groupByClause.expressions.isEmpty()) {
+            return true;
+        }
+        for (ColumnExpression column : select.columns) {
+            if (column.expression instanceof AggregateExpression) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private QueryResult aggregate(SelectStatement select, List<Map<String, Object>> sourceRows) {
+        List<Expression> groupExpressions = select.groupByClause == null || select.groupByClause.expressions == null
+                ? List.of()
+                : select.groupByClause.expressions;
+        List<String> outputColumns = new ArrayList<>();
+        for (ColumnExpression column : select.columns) {
+            outputColumns.add(outputColumnName(column));
+        }
+
+        Map<String, GroupBucket> groups = new LinkedHashMap<>();
+        for (Map<String, Object> row : sourceRows) {
+            List<Object> keyValues = new ArrayList<>();
+            for (Expression expression : groupExpressions) {
+                keyValues.add(valueForExpression(row, expression));
+            }
+            String key = keyValues.stream().map(String::valueOf).reduce((left, right) -> left + "\u0001" + right).orElse("__all__");
+            groups.computeIfAbsent(key, ignored -> new GroupBucket(keyValues)).rows.add(row);
+        }
+        if (groups.isEmpty()) {
+            groups.put("__all__", new GroupBucket(List.of()));
+        }
+
+        List<Map<String, Object>> outputRows = new ArrayList<>();
+        for (GroupBucket bucket : groups.values()) {
+            Map<String, Object> output = new LinkedHashMap<>();
+            for (ColumnExpression column : select.columns) {
+                output.put(outputColumnName(column), aggregateValue(bucket.rows, column.expression));
+            }
+            outputRows.add(output);
+        }
+        return QueryResult.rows(outputColumns, outputRows);
+    }
+
+    private Object aggregateValue(List<Map<String, Object>> rows, Expression expression) {
+        if (expression instanceof AggregateExpression aggregate) {
+            return aggregateFunction(rows, aggregate);
+        }
+        return rows.isEmpty() ? null : valueForExpression(rows.get(0), expression);
+    }
+
+    private Object aggregateFunction(List<Map<String, Object>> rows, FunctionCallExpression function) {
+        String name = function.functionName.toLowerCase(Locale.ROOT);
+        if ("count".equals(name)) {
+            if (function.arguments == null || function.arguments.isEmpty()
+                    || function.arguments.get(0) instanceof IdentifierExpression identifier && "*".equals(identifier.name)) {
+                return rows.size();
+            }
+            return rows.stream()
+                    .map(row -> valueForExpression(row, function.arguments.get(0)))
+                    .filter(value -> value != null)
+                    .count();
+        }
+        List<Object> values = new ArrayList<>();
+        if (function.arguments != null && !function.arguments.isEmpty()) {
+            for (Map<String, Object> row : rows) {
+                values.add(valueForExpression(row, function.arguments.get(0)));
+            }
+        }
+        if ("sum".equals(name)) {
+            return values.stream().filter(Number.class::isInstance)
+                    .map(Number.class::cast)
+                    .mapToDouble(Number::doubleValue)
+                    .sum();
+        }
+        if ("avg".equals(name)) {
+            return values.stream().filter(Number.class::isInstance)
+                    .map(Number.class::cast)
+                    .mapToDouble(Number::doubleValue)
+                    .average()
+                    .orElse(0.0);
+        }
+        if ("min".equals(name)) {
+            return values.stream().filter(value -> value != null).min(this::compareValues).orElse(null);
+        }
+        if ("max".equals(name)) {
+            return values.stream().filter(value -> value != null).max(this::compareValues).orElse(null);
+        }
+        throw new IllegalArgumentException("Unsupported aggregate function: " + function.functionName);
+    }
+
+    private Object valueForExpression(Map<String, Object> row, Expression expression) {
+        if (expression instanceof IdentifierExpression identifier) {
+            if ("*".equals(identifier.name)) {
+                return "*";
+            }
+            return valueForIdentifier(row, identifier);
+        }
+        throw new IllegalArgumentException("Aggregation only supports column names and aggregate functions");
+    }
+
+    private Object valueForIdentifier(Map<String, Object> row, IdentifierExpression identifier) {
+        if (identifier.tableName != null && !identifier.tableName.isBlank()) {
+            String qualified = qualifiedName(identifier.tableName, identifier.name);
+            if (row.containsKey(qualified)) {
+                return row.get(qualified);
+            }
+        }
+        return valueForOrder(row, identifier.name);
+    }
+
+    private String outputColumnName(ColumnExpression column) {
+        if (column.alias != null && !column.alias.isBlank()) {
+            return column.alias;
+        }
+        if (column.expression instanceof IdentifierExpression identifier) {
+            return identifier.name;
+        }
+        if (column.expression instanceof FunctionCallExpression function) {
+            String argument = "*";
+            if (function.arguments != null && !function.arguments.isEmpty()
+                    && function.arguments.get(0) instanceof IdentifierExpression identifier) {
+                argument = identifier.name;
+            }
+            return function.functionName.toUpperCase(Locale.ROOT) + "(" + argument + ")";
+        }
+        return "expr";
+    }
+
+    private static class GroupBucket {
+        private final List<Object> keyValues;
+        private final List<Map<String, Object>> rows = new ArrayList<>();
+
+        private GroupBucket(List<Object> keyValues) {
+            this.keyValues = keyValues;
+        }
+    }
+
+    private Comparator<Map<String, Object>> orderByComparator(List<OrderByItem> items) {
+        return (left, right) -> {
+            for (OrderByItem item : items) {
+                String column = orderByColumnName(item.expression);
+                int comparison = compareValues(valueForOrder(left, column), valueForOrder(right, column));
+                if (comparison != 0) {
+                    return item.order == Order.DESC ? -comparison : comparison;
+                }
+            }
+            return 0;
+        };
+    }
+
+    private String orderByColumnName(Expression expression) {
+        if (expression instanceof IdentifierExpression identifier) {
+            return identifier.name;
+        }
+        throw new IllegalArgumentException("ORDER BY only supports column names");
+    }
+
+    private Object valueForOrder(Map<String, Object> row, String column) {
+        for (Map.Entry<String, Object> entry : row.entrySet()) {
+            if (entry.getKey().equalsIgnoreCase(column)) {
+                return entry.getValue();
+            }
+        }
+        return null;
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private int compareValues(Object left, Object right) {
+        if (left == null && right == null) {
+            return 0;
+        }
+        if (left == null) {
+            return 1;
+        }
+        if (right == null) {
+            return -1;
+        }
+        if (left instanceof Number leftNumber && right instanceof Number rightNumber) {
+            return BigDecimal.valueOf(leftNumber.doubleValue()).compareTo(BigDecimal.valueOf(rightNumber.doubleValue()));
+        }
+        if (left instanceof Comparable comparable && left.getClass().isInstance(right)) {
+            return comparable.compareTo(right);
+        }
+        return String.valueOf(left).compareTo(String.valueOf(right));
     }
 
     private QueryResult showTables() {
@@ -136,6 +361,83 @@ public class Coordinator {
                 String tableName = values.isEmpty() ? "" : String.valueOf(values.get(0));
                 String tableType = values.size() < 2 ? "" : String.valueOf(values.get(1));
                 rows.addAll(showTableRows(node, tableName, tableType));
+            }
+        }
+        return QueryResult.rows(columns, rows);
+    }
+
+    private QueryResult showNodes() {
+        List<String> columns = List.of("nodeId", "endpoint", "status", "role", "partner", "reads", "writes");
+        List<Map<String, Object>> rows = new ArrayList<>();
+        for (NodeRecord node : dataNodes.values()) {
+            rows.add(nodeRow(node));
+        }
+        return QueryResult.rows(columns, rows);
+    }
+
+    private Map<String, Object> nodeRow(NodeRecord node) {
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("nodeId", node.nodeId());
+        row.put("endpoint", node.host() + ":" + node.port());
+        row.put("status", node.status());
+        row.put("role", node.role() == null ? "UNASSIGNED" : node.role());
+        row.put("partner", node.partnerNodeId() == null ? "-" : node.partnerNodeId());
+        row.put("reads", node.readRequests());
+        row.put("writes", node.writeRequests());
+        return row;
+    }
+
+    private QueryResult showShards(String tableName) {
+        List<String> columns = List.of("tableName", "partitionKey", "routeVersion", "shardName", "shardIndex", "primary", "replicas");
+        List<Map<String, Object>> rows = new ArrayList<>();
+        for (TableMetadata table : catalog.clusterMetadata().getTables()) {
+            if (tableName != null && !table.getTableName().equalsIgnoreCase(tableName)) {
+                continue;
+            }
+            for (ShardMetadata shard : table.getShards()) {
+                Map<String, Object> row = new LinkedHashMap<>();
+                row.put("tableName", table.getTableName());
+                row.put("partitionKey", table.getPartitionKey());
+                row.put("routeVersion", catalog.routeVersion());
+                row.put("shardName", shard.getShardName());
+                row.put("shardIndex", shard.getShardIndex());
+                row.put("primary", shard.getPrimaryNodeId());
+                row.put("replicas", shard.getReplicaNodeIds());
+                rows.add(row);
+            }
+        }
+        if (rows.isEmpty() && tableName != null && catalog.clusterMetadata().getTable(tableName) == null) {
+            throw new IllegalArgumentException("Unknown table: " + tableName);
+        }
+        return QueryResult.rows(columns, rows);
+    }
+
+    private QueryResult showCluster() {
+        List<String> columns = List.of("section", "name", "detail1", "detail2", "detail3", "detail4", "routeVersion");
+        List<Map<String, Object>> rows = new ArrayList<>();
+        for (NodeRecord node : dataNodes.values()) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("section", "node");
+            row.put("name", node.nodeId());
+            row.put("detail1", node.host() + ":" + node.port());
+            row.put("detail2", node.status());
+            row.put("detail3", node.role() == null ? "UNASSIGNED" : node.role());
+            row.put("detail4", "partner=" + (node.partnerNodeId() == null ? "-" : node.partnerNodeId())
+                    + ", reads=" + node.readRequests() + ", writes=" + node.writeRequests());
+            row.put("routeVersion", catalog.routeVersion());
+            rows.add(row);
+        }
+        for (TableMetadata table : catalog.clusterMetadata().getTables()) {
+            for (ShardMetadata shard : table.getShards()) {
+                Map<String, Object> row = new LinkedHashMap<>();
+                row.put("section", "shard");
+                row.put("name", shard.getShardName());
+                row.put("detail1", "table=" + table.getTableName());
+                row.put("detail2", "partitionKey=" + table.getPartitionKey());
+                row.put("detail3", "primary=" + shard.getPrimaryNodeId());
+                row.put("detail4", "replicas=" + shard.getReplicaNodeIds());
+                row.put("routeVersion", catalog.routeVersion());
+                rows.add(row);
             }
         }
         return QueryResult.rows(columns, rows);
@@ -356,7 +658,10 @@ public class Coordinator {
                 || !(join.condition.right instanceof IdentifierExpression rightJoinExpression)) {
             return null;
         }
-        if (join.joinType != null && !"INNER".equalsIgnoreCase(join.joinType.name())) {
+        boolean leftJoin = join.joinType != null && "LEFT".equalsIgnoreCase(join.joinType.name());
+        if (join.joinType != null
+                && !"INNER".equalsIgnoreCase(join.joinType.name())
+                && !leftJoin) {
             return null;
         }
 
@@ -380,23 +685,12 @@ public class Coordinator {
         addDistinct(rightColumns, rightKey.name);
         List<String> outputColumns = new ArrayList<>();
         for (ColumnExpression column : select.columns) {
-            if (!(column.expression instanceof IdentifierExpression identifier)) {
-                return null;
+            collectColumnsForExpression(column.expression, leftTable, rightTable, leftColumns, rightColumns, outputColumns, column);
+        }
+        if (select.groupByClause != null && select.groupByClause.expressions != null) {
+            for (Expression expression : select.groupByClause.expressions) {
+                collectColumnsForExpression(expression, leftTable, rightTable, leftColumns, rightColumns, outputColumns, null);
             }
-            if ("*".equals(identifier.name)) {
-                addAllTableColumns(leftTable.tableName, leftColumns);
-                addAllTableColumns(rightTable.tableName, rightColumns);
-                addAllOutputColumns(leftTable.tableName, outputColumns);
-                addAllOutputColumns(rightTable.tableName, outputColumns);
-                continue;
-            }
-            TableReference owner = resolveOwner(identifier, leftTable, rightTable);
-            if (owner == leftTable) {
-                addDistinct(leftColumns, identifier.name);
-            } else {
-                addDistinct(rightColumns, identifier.name);
-            }
-            addDistinct(outputColumns, outputName(column, identifier));
         }
 
         try (TableLockManager.TableLocks ignored = tableLocks.lockTables(tableNames(select), false)) {
@@ -412,25 +706,95 @@ public class Coordinator {
             for (Map<String, Object> leftRow : leftRows) {
                 List<Map<String, Object>> matches = rightByKey.get(normalizeJoinKey(valueFor(leftRow, leftTable, leftKey.name)));
                 if (matches == null) {
+                    if (leftJoin) {
+                        Map<String, Object> output = new LinkedHashMap<>();
+                        putInternalColumns(output, leftTable, leftRow);
+                        outputRowsForSelect(output, select, leftTable, rightTable, leftRow, Map.of());
+                        joinedRows.add(output);
+                    }
                     continue;
                 }
                 for (Map<String, Object> rightRow : matches) {
                     Map<String, Object> output = new LinkedHashMap<>();
-                    for (ColumnExpression column : select.columns) {
-                        IdentifierExpression identifier = (IdentifierExpression) column.expression;
-                        if ("*".equals(identifier.name)) {
-                            putStarColumns(output, leftTable, leftRow);
-                            putStarColumns(output, rightTable, rightRow);
-                            continue;
-                        }
-                        TableReference owner = resolveOwner(identifier, leftTable, rightTable);
-                        Map<String, Object> source = owner == leftTable ? leftRow : rightRow;
-                        output.put(outputName(column, identifier), valueFor(source, owner, identifier.name));
-                    }
+                    putInternalColumns(output, leftTable, leftRow);
+                    putInternalColumns(output, rightTable, rightRow);
+                    outputRowsForSelect(output, select, leftTable, rightTable, leftRow, rightRow);
                     joinedRows.add(output);
                 }
             }
             return QueryResult.rows(outputColumns, joinedRows);
+        }
+    }
+
+    private void collectColumnsForExpression(Expression expression, TableReference leftTable, TableReference rightTable,
+                                             List<String> leftColumns, List<String> rightColumns,
+                                             List<String> outputColumns, ColumnExpression outputColumn) {
+        if (expression instanceof AggregateExpression aggregate) {
+            if (aggregate.arguments != null) {
+                for (Expression argument : aggregate.arguments) {
+                    collectColumnsForExpression(argument, leftTable, rightTable, leftColumns, rightColumns, outputColumns, null);
+                }
+            }
+            if (outputColumn != null) {
+                addDistinct(outputColumns, outputColumnName(outputColumn));
+            }
+            return;
+        }
+        if (!(expression instanceof IdentifierExpression identifier)) {
+            return;
+        }
+        if ("*".equals(identifier.name)) {
+            addAllTableColumns(leftTable.tableName, leftColumns);
+            addAllTableColumns(rightTable.tableName, rightColumns);
+            if (outputColumn != null) {
+                addAllOutputColumns(leftTable.tableName, outputColumns);
+                addAllOutputColumns(rightTable.tableName, outputColumns);
+            }
+            return;
+        }
+        TableReference owner = resolveOwner(identifier, leftTable, rightTable);
+        if (owner == leftTable) {
+            addDistinct(leftColumns, identifier.name);
+        } else {
+            addDistinct(rightColumns, identifier.name);
+        }
+        if (outputColumn != null) {
+            addDistinct(outputColumns, outputName(outputColumn, identifier));
+        }
+    }
+
+    private void outputRowsForSelect(Map<String, Object> output, SelectStatement select, TableReference leftTable,
+                                     TableReference rightTable, Map<String, Object> leftRow, Map<String, Object> rightRow) {
+        if (requiresAggregation(select)) {
+            return;
+        }
+        for (ColumnExpression column : select.columns) {
+            if (!(column.expression instanceof IdentifierExpression identifier)) {
+                continue;
+            }
+            if ("*".equals(identifier.name)) {
+                putStarColumns(output, leftTable, leftRow);
+                putStarColumns(output, rightTable, rightRow);
+                continue;
+            }
+            TableReference owner = resolveOwner(identifier, leftTable, rightTable);
+            Map<String, Object> source = owner == leftTable ? leftRow : rightRow;
+            output.put(outputName(column, identifier), valueFor(source, owner, identifier.name));
+        }
+    }
+
+    private void putInternalColumns(Map<String, Object> output, TableReference table, Map<String, Object> source) {
+        parser.semantic.TableSchema schema = catalog.schemaCatalog().getTable(table.tableName);
+        if (schema == null) {
+            return;
+        }
+        for (parser.semantic.ColumnSchema column : schema.getColumns()) {
+            Object value = valueFor(source, table, column.getName());
+            output.put(qualifiedName(table.tableName, column.getName()), value);
+            if (table.alias != null) {
+                output.put(qualifiedName(table.alias, column.getName()), value);
+            }
+            output.putIfAbsent(column.getName().toLowerCase(Locale.ROOT), value);
         }
     }
 
@@ -634,12 +998,29 @@ public class Coordinator {
             recordRequest(node, request.getStatement());
             RemoteSqlResult result = remoteClient.execute(node, request);
             if (!result.success()) {
+                if (isIgnorableMissingIndexDrop(request, result)) {
+                    results.add(new RemoteSqlResult(true, List.of(), List.of(), 0, null));
+                    continue;
+                }
                 node.markOffline(result.error());
                 throw new IllegalStateException("DataNode " + node.nodeId() + " execution failed: " + result.error());
             }
             results.add(result);
         }
         return merge(results);
+    }
+
+    private boolean isIgnorableMissingIndexDrop(RemoteExecutionRequest request, RemoteSqlResult result) {
+        String statement = request.getStatement() == null ? "" : request.getStatement().stripLeading().toUpperCase(Locale.ROOT);
+        if (!statement.startsWith("DROP INDEX")) {
+            return false;
+        }
+        String error = result.error() == null ? "" : result.error().toLowerCase(Locale.ROOT);
+        return error.contains("check that column/key exists")
+                || error.contains("does not exist")
+                || error.contains("not exist")
+                || error.contains("unknown index")
+                || error.contains("can't drop");
     }
 
     private QueryResult merge(List<RemoteSqlResult> results) {
