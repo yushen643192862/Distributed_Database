@@ -68,6 +68,8 @@ public class HealthMonitor {
             }
         } else if (node.role() == ReplicaRole.PRIMARY) {
             rebalancer.rebalance();
+        } else if (node.role() == ReplicaRole.REPLICA) {
+            catalog.detachReplica(node.nodeId());
         }
         saveState();
     }

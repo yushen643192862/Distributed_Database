@@ -171,7 +171,7 @@ public class Coordinator {
         for (Map<String, Object> row : sourceRows) {
             List<Object> keyValues = new ArrayList<>();
             for (Expression expression : groupExpressions) {
-                keyValues.add(valueForExpression(row, expression));
+                keyValues.add(normalizeGroupValue(valueForExpression(row, expression)));
             }
             String key = keyValues.stream().map(String::valueOf).reduce((left, right) -> left + "\u0001" + right).orElse("__all__");
             groups.computeIfAbsent(key, ignored -> new GroupBucket(keyValues)).rows.add(row);
@@ -191,11 +191,18 @@ public class Coordinator {
         return QueryResult.rows(outputColumns, outputRows);
     }
 
+    private Object normalizeGroupValue(Object value) {
+        if (value instanceof String text) {
+            return text.stripTrailing();
+        }
+        return value;
+    }
+
     private Object aggregateValue(List<Map<String, Object>> rows, Expression expression) {
         if (expression instanceof AggregateExpression aggregate) {
             return aggregateFunction(rows, aggregate);
         }
-        return rows.isEmpty() ? null : valueForExpression(rows.get(0), expression);
+        return rows.isEmpty() ? null : normalizeGroupValue(valueForExpression(rows.get(0), expression));
     }
 
     private Object aggregateFunction(List<Map<String, Object>> rows, FunctionCallExpression function) {
@@ -999,7 +1006,7 @@ public class Coordinator {
             RemoteSqlResult result = remoteClient.execute(node, request);
             if (!result.success()) {
                 if (isIgnorableMissingIndexDrop(request, result)) {
-                    results.add(new RemoteSqlResult(true, List.of(), List.of(), 0, null));
+                    results.add(new RemoteSqlResult(node.nodeId(), true, List.of(), List.of(), List.of(), 0, null));
                     continue;
                 }
                 node.markOffline(result.error());

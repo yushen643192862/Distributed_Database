@@ -70,20 +70,23 @@ function Show-Step([string]$Text) {
 }
 
 function Read-NodeStats {
-    $message = MessageOf (Invoke-MiniSql "SHOW NODES;").result
+    $result = (Invoke-MiniSql "SHOW NODES;").result
     $stats = @{}
-    foreach ($line in ($message -split "`r?`n")) {
-        $match = [regex]::Match($line, "^(?<id>\S+).*status=(?<status>\S+).*role=(?<role>\S+).*partner=(?<partner>\S+).*reads=(?<reads>\d+).*writes=(?<writes>\d+)")
-        if (-not $match.Success) {
+    foreach ($row in (RowsOf $result)) {
+        $nodeId = "$($row.nodeId)"
+        if ([string]::IsNullOrWhiteSpace($nodeId)) {
+            $nodeId = "$($row.NodeId)"
+        }
+        if ([string]::IsNullOrWhiteSpace($nodeId)) {
             continue
         }
-        $stats[$match.Groups["id"].Value] = [pscustomobject]@{
-            NodeId = $match.Groups["id"].Value
-            Status = $match.Groups["status"].Value
-            Role = $match.Groups["role"].Value
-            Partner = $match.Groups["partner"].Value
-            Reads = [long]$match.Groups["reads"].Value
-            Writes = [long]$match.Groups["writes"].Value
+        $stats[$nodeId] = [pscustomobject]@{
+            NodeId = $nodeId
+            Status = "$($row.status)"
+            Role = "$($row.role)"
+            Partner = "$($row.partner)"
+            Reads = [long]$row.reads
+            Writes = [long]$row.writes
         }
     }
     return $stats
@@ -95,18 +98,18 @@ function Get-NodeReads([hashtable]$Stats, [string]$NodeId) {
 }
 
 function Get-LbShardPlacement {
-    $message = MessageOf (Invoke-MiniSql "SHOW SHARDS lb_user;").result
-    Write-Host $message
-    $match = [regex]::Match($message, "lb_user_0\s+primary=(?<primary>\S+)\s+replicas=\[(?<replicas>[^\]]*)\]")
-    Assert-True $match.Success "Could not parse lb_user_0 placement."
+    $result = (Invoke-MiniSql "SHOW SHARDS lb_user;").result
+    $rows = RowsOf $result
+    $row = $rows | Where-Object { "$($_.shardName)" -eq "lb_user_0" } | Select-Object -First 1
+    Assert-True ($null -ne $row) "Could not find lb_user_0 placement."
     $replicas = @(
-        $match.Groups["replicas"].Value -split "," |
+        "$($row.replicas)" -replace '^\[|\]$', '' -split "," |
             ForEach-Object { $_.Trim() } |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
     )
     Assert-True ($replicas.Count -ge 1) "lb_user_0 has no replica. Start at least one replica datanode."
     return [pscustomobject]@{
-        Primary = $match.Groups["primary"].Value
+        Primary = "$($row.primary)"
         Replica = $replicas[0]
     }
 }
@@ -138,9 +141,9 @@ $replicaFailed = $false
 
 try {
     Show-Step "Preflight"
-    $nodes = MessageOf (Invoke-MiniSql "SHOW NODES;").result
-    Write-Host $nodes
-    $onlineCount = ([regex]::Matches($nodes, "status=ONLINE")).Count
+    $nodeRows = RowsOf (Invoke-MiniSql "SHOW NODES;").result
+    $onlineCount = @($nodeRows | Where-Object { "$($_.status)" -eq "ONLINE" }).Count
+    $nodeRows | Format-Table | Out-String | Write-Host
     Assert-True ($onlineCount -ge 2) "Need at least 2 ONLINE datanodes."
 
     Show-Step "Prepare table"

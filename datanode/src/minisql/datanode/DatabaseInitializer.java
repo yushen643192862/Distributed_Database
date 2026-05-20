@@ -1,9 +1,13 @@
 package minisql.datanode;
 
 import java.sql.Connection;
+import java.sql.DatabaseMetaData;
 import java.sql.DriverManager;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 
 final class DatabaseInitializer {
@@ -17,6 +21,7 @@ final class DatabaseInitializer {
             return;
         }
         try (Connection ignored = DriverManager.getConnection(config.jdbcUrl(), config.jdbcUser(), config.jdbcPassword())) {
+            resetTables(config, type);
             return;
         } catch (SQLException ex) {
             DatabaseTarget target = parseTarget(config.jdbcUrl(), type);
@@ -24,6 +29,7 @@ final class DatabaseInitializer {
                 throw new IllegalStateException("Cannot connect to " + target.databaseName() + ": " + message(ex), ex);
             }
             createDatabase(config, target, type);
+            resetTables(config, type);
         }
     }
 
@@ -46,6 +52,35 @@ final class DatabaseInitializer {
             throw new IllegalStateException("Failed to create database " + target.databaseName()
                     + " using " + target.serverUrl() + ": " + message(ex), ex);
         }
+    }
+
+    private static void resetTables(DataNodeConfig config, String type) {
+        try (Connection connection = DriverManager.getConnection(config.jdbcUrl(), config.jdbcUser(), config.jdbcPassword());
+             Statement statement = connection.createStatement()) {
+            for (String tableName : listTables(connection, type)) {
+                String sql = "DROP TABLE IF EXISTS " + quoteIdentifier(tableName, type);
+                if ("POSTGRESQL".equals(type)) {
+                    sql += " CASCADE";
+                }
+                statement.executeUpdate(sql);
+            }
+        } catch (SQLException ex) {
+            throw new IllegalStateException("Failed to reset tables for " + config.nodeId()
+                    + " using " + config.jdbcUrl() + ": " + message(ex), ex);
+        }
+    }
+
+    private static List<String> listTables(Connection connection, String type) throws SQLException {
+        DatabaseMetaData metaData = connection.getMetaData();
+        String catalog = "MYSQL".equals(type) ? connection.getCatalog() : null;
+        String schema = "POSTGRESQL".equals(type) ? "public" : null;
+        List<String> tables = new ArrayList<>();
+        try (ResultSet resultSet = metaData.getTables(catalog, schema, "%", new String[]{"TABLE"})) {
+            while (resultSet.next()) {
+                tables.add(resultSet.getString("TABLE_NAME"));
+            }
+        }
+        return tables;
     }
 
     private static boolean isMissingDatabase(SQLException ex, String type, String databaseName) {

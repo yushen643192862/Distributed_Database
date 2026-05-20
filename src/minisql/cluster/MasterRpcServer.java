@@ -31,7 +31,6 @@ public class MasterRpcServer {
     private final Coordinator coordinator;
     private final ClusterRebalancer rebalancer;
     private final Runnable stateSaver;
-    private final int targetPrimaryCount;
     private final ExecutorService maintenanceExecutor = Executors.newSingleThreadExecutor();
     private final AtomicBoolean maintenanceQueued = new AtomicBoolean(false);
     private HttpServer server;
@@ -45,7 +44,6 @@ public class MasterRpcServer {
         this.rebalancer = rebalancer;
         this.stateSaver = stateSaver;
         this.port = port;
-        this.targetPrimaryCount = resolveTargetPrimaryCount();
     }
 
     public void start() {
@@ -192,7 +190,7 @@ public class MasterRpcServer {
             return primary == null ? RegistrationAction.NONE : RegistrationAction.REPAIR;
         }
 
-        if (primaryCountExcluding(node) < targetPrimaryCount) {
+        if (primaryCountExcluding(node) < targetPrimaryCount()) {
             node.assignRole(ReplicaRole.PRIMARY, null);
             NodeRecord replica = unpairedReplica();
             if (replica != null) {
@@ -209,13 +207,8 @@ public class MasterRpcServer {
             return RegistrationAction.REPAIR;
         }
 
-        node.assignRole(ReplicaRole.PRIMARY, null);
-        NodeRecord replica = unpairedReplica();
-        if (replica != null) {
-            node.assignRole(ReplicaRole.PRIMARY, replica.nodeId());
-            replica.assignRole(ReplicaRole.REPLICA, node.nodeId());
-        }
-        return RegistrationAction.REHASH;
+        node.assignRole(ReplicaRole.REPLICA, null);
+        return RegistrationAction.NONE;
     }
 
     private RegistrationAction repairExistingRole(NodeRecord node) {
@@ -262,6 +255,16 @@ public class MasterRpcServer {
                 .filter(node -> node != excluded)
                 .filter(node -> node.role() == ReplicaRole.PRIMARY)
                 .count();
+    }
+
+    private int targetPrimaryCount() {
+        long onlineCount = dataNodes.values().stream()
+                .filter(NodeRecord::isAvailable)
+                .count();
+        if (onlineCount <= 1) {
+            return (int) onlineCount;
+        }
+        return (int) onlineCount / 2;
     }
 
     private NodeRecord primaryWithoutReplica() {
@@ -365,6 +368,8 @@ public class MasterRpcServer {
                 }
             } else if (candidate.role() == ReplicaRole.PRIMARY) {
                 rebalancer.rebalance();
+            } else if (candidate.role() == ReplicaRole.REPLICA) {
+                catalog.detachReplica(candidate.nodeId());
             }
         }
     }
@@ -432,14 +437,6 @@ public class MasterRpcServer {
             return number.longValue();
         }
         return Long.parseLong(String.valueOf(value));
-    }
-
-    private int resolveTargetPrimaryCount() {
-        String value = System.getenv("MINISQL_PRIMARY_COUNT");
-        if (value == null || value.isBlank()) {
-            return 3;
-        }
-        return Integer.parseInt(value);
     }
 
     private long resolveHeartbeatTimeoutMs() {

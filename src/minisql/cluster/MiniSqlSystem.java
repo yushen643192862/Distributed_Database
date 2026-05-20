@@ -63,9 +63,9 @@ public class MiniSqlSystem {
         if (dataNodes.values().stream().anyMatch(node -> node.role() != null)) {
             return;
         }
-        int targetPrimaries = resolveTargetPrimaryCount();
         List<NodeRecord> nodes = new ArrayList<>(dataNodes.values());
         nodes.sort(Comparator.comparing(NodeRecord::nodeId));
+        int targetPrimaries = targetPrimaryCount(nodes.size());
         List<NodeRecord> primaries = new ArrayList<>();
         for (NodeRecord node : nodes) {
             if (primaries.size() < targetPrimaries) {
@@ -163,12 +163,11 @@ public class MiniSqlSystem {
         return 5000;
     }
 
-    private static int resolveTargetPrimaryCount() {
-        String value = System.getenv("MINISQL_PRIMARY_COUNT");
-        if (value == null || value.isBlank()) {
-            return 3;
+    private static int targetPrimaryCount(int nodeCount) {
+        if (nodeCount <= 1) {
+            return nodeCount;
         }
-        return Integer.parseInt(value);
+        return nodeCount / 2;
     }
 
     private record State(RuntimeCatalog catalog, Map<String, NodeRecord> dataNodes) implements Serializable {
