@@ -14,7 +14,9 @@ import physical.TableMetadata;
 import parser.parser.ASTNode;
 import parser.parser.AlterTableStatement;
 import parser.parser.AggregateExpression;
+import parser.parser.BinaryExpression;
 import parser.parser.ColumnExpression;
+import parser.parser.Condition;
 import parser.parser.CreateTableStatement;
 import parser.parser.DeleteStatement;
 import parser.parser.DropTableStatement;
@@ -24,12 +26,14 @@ import parser.parser.IdentifierExpression;
 import parser.parser.InsertStatement;
 import parser.parser.Index;
 import parser.parser.JoinClause;
+import parser.parser.LiteralExpression;
 import parser.parser.Order;
 import parser.parser.OrderByItem;
 import parser.parser.Parser;
 import parser.parser.SelectStatement;
 import parser.parser.TableReference;
 import parser.parser.TruncateTableStatement;
+import parser.parser.UnaryExpression;
 import parser.parser.UpdateStatement;
 import parser.semantic.SemanticAnalyzer;
 
@@ -335,6 +339,9 @@ public class Coordinator {
         if (left instanceof Number leftNumber && right instanceof Number rightNumber) {
             return BigDecimal.valueOf(leftNumber.doubleValue()).compareTo(BigDecimal.valueOf(rightNumber.doubleValue()));
         }
+        if (left instanceof String leftText && right instanceof String rightText) {
+            return leftText.stripTrailing().compareTo(rightText.stripTrailing());
+        }
         if (left instanceof Comparable comparable && left.getClass().isInstance(right)) {
             return comparable.compareTo(right);
         }
@@ -635,7 +642,7 @@ public class Coordinator {
     }
 
     private QueryResult reshardCluster() {
-        List<String> changes = rebalancer.rebalance();
+        List<String> changes = rebalancer.reshard(Set.of());
         if (changes.isEmpty()) {
             return QueryResult.message("Cluster reshard checked; no changes.");
         }
@@ -652,8 +659,7 @@ public class Coordinator {
         if (!(parsed instanceof SelectStatement select)
                 || select.fromClause == null
                 || select.fromClause.joins == null
-                || select.fromClause.joins.size() != 1
-                || select.whereClause != null) {
+                || select.fromClause.joins.size() != 1) {
             return null;
         }
 
@@ -699,6 +705,17 @@ public class Coordinator {
                 collectColumnsForExpression(expression, leftTable, rightTable, leftColumns, rightColumns, outputColumns, null);
             }
         }
+        if (select.whereClause != null) {
+            collectColumnsForCondition(select.whereClause.condition, leftTable, rightTable, leftColumns, rightColumns);
+        }
+        if (select.havingClause != null) {
+            collectColumnsForCondition(select.havingClause.condition, leftTable, rightTable, leftColumns, rightColumns);
+        }
+        if (select.orderByClause != null && select.orderByClause.items != null) {
+            for (OrderByItem item : select.orderByClause.items) {
+                collectColumnsForExpression(item.expression, leftTable, rightTable, leftColumns, rightColumns, outputColumns, null);
+            }
+        }
 
         try (TableLockManager.TableLocks ignored = tableLocks.lockTables(tableNames(select), false)) {
             List<Map<String, Object>> leftRows = readTableRows(leftTable, leftColumns);
@@ -716,8 +733,10 @@ public class Coordinator {
                     if (leftJoin) {
                         Map<String, Object> output = new LinkedHashMap<>();
                         putInternalColumns(output, leftTable, leftRow);
-                        outputRowsForSelect(output, select, leftTable, rightTable, leftRow, Map.of());
-                        joinedRows.add(output);
+                        if (matchesWhere(output, select)) {
+                            outputRowsForSelect(output, select, leftTable, rightTable, leftRow, Map.of());
+                            joinedRows.add(output);
+                        }
                     }
                     continue;
                 }
@@ -725,12 +744,30 @@ public class Coordinator {
                     Map<String, Object> output = new LinkedHashMap<>();
                     putInternalColumns(output, leftTable, leftRow);
                     putInternalColumns(output, rightTable, rightRow);
-                    outputRowsForSelect(output, select, leftTable, rightTable, leftRow, rightRow);
-                    joinedRows.add(output);
+                    if (matchesWhere(output, select)) {
+                        outputRowsForSelect(output, select, leftTable, rightTable, leftRow, rightRow);
+                        joinedRows.add(output);
+                    }
                 }
             }
             return QueryResult.rows(outputColumns, joinedRows);
         }
+    }
+
+    private void collectColumnsForCondition(Condition condition, TableReference leftTable, TableReference rightTable,
+                                            List<String> leftColumns, List<String> rightColumns) {
+        if (condition == null) {
+            return;
+        }
+        collectColumnsForExpression(condition.left, leftTable, rightTable, leftColumns, rightColumns, new ArrayList<>(), null);
+        collectColumnsForExpression(condition.right, leftTable, rightTable, leftColumns, rightColumns, new ArrayList<>(), null);
+        if (condition.rightExpressions != null) {
+            for (Expression expression : condition.rightExpressions) {
+                collectColumnsForExpression(expression, leftTable, rightTable, leftColumns, rightColumns, new ArrayList<>(), null);
+            }
+        }
+        collectColumnsForCondition(condition.leftCondition, leftTable, rightTable, leftColumns, rightColumns);
+        collectColumnsForCondition(condition.rightCondition, leftTable, rightTable, leftColumns, rightColumns);
     }
 
     private void collectColumnsForExpression(Expression expression, TableReference leftTable, TableReference rightTable,
@@ -788,6 +825,141 @@ public class Coordinator {
             Map<String, Object> source = owner == leftTable ? leftRow : rightRow;
             output.put(outputName(column, identifier), valueFor(source, owner, identifier.name));
         }
+    }
+
+    private boolean matchesWhere(Map<String, Object> row, SelectStatement select) {
+        return select.whereClause == null || evaluateCondition(row, select.whereClause.condition);
+    }
+
+    private boolean evaluateCondition(Map<String, Object> row, Condition condition) {
+        if (condition == null) {
+            return true;
+        }
+        if (condition.logicalOperator != null && condition.leftCondition != null && condition.rightCondition != null) {
+            if (condition.logicalOperator.type == tokenType.OR) {
+                return evaluateCondition(row, condition.leftCondition) || evaluateCondition(row, condition.rightCondition);
+            }
+            return evaluateCondition(row, condition.leftCondition) && evaluateCondition(row, condition.rightCondition);
+        }
+        if (condition.logicalOperator != null && condition.rightCondition != null) {
+            return !evaluateCondition(row, condition.rightCondition);
+        }
+        Object left = valueForJoinExpression(row, condition.left);
+        if (condition.operator == null) {
+            return truthy(left);
+        }
+        if (condition.operator.type == tokenType.IS) {
+            boolean matches = isNullLiteral(condition.right)
+                    ? left == null
+                    : compareValues(left, valueForJoinExpression(row, condition.right)) == 0;
+            return condition.logicalOperator != null && condition.logicalOperator.type == tokenType.NOT
+                    ? !matches
+                    : matches;
+        }
+        if (left == null) {
+            return false;
+        }
+        if (condition.operator.type == tokenType.BETWEEN) {
+            if (condition.rightExpressions == null || condition.rightExpressions.size() != 2) {
+                return false;
+            }
+            Object lower = valueForJoinExpression(row, condition.rightExpressions.get(0));
+            Object upper = valueForJoinExpression(row, condition.rightExpressions.get(1));
+            return lower != null && upper != null
+                    && compareValues(left, lower) >= 0
+                    && compareValues(left, upper) <= 0;
+        }
+        if (condition.operator.type == tokenType.IN) {
+            if (condition.rightExpressions == null) {
+                return false;
+            }
+            for (Expression expression : condition.rightExpressions) {
+                Object candidate = valueForJoinExpression(row, expression);
+                if (candidate != null && compareValues(left, candidate) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        Object right = valueForJoinExpression(row, condition.right);
+        if (right == null) {
+            return false;
+        }
+        int comparison = compareValues(left, right);
+        if (condition.operator.type == tokenType.EQ) {
+            return comparison == 0;
+        }
+        if (condition.operator.type == tokenType.NE) {
+            return comparison != 0;
+        }
+        if (condition.operator.type == tokenType.GT) {
+            return comparison > 0;
+        }
+        if (condition.operator.type == tokenType.GE) {
+            return comparison >= 0;
+        }
+        if (condition.operator.type == tokenType.LT) {
+            return comparison < 0;
+        }
+        if (condition.operator.type == tokenType.LE) {
+            return comparison <= 0;
+        }
+        return false;
+    }
+
+    private Object valueForJoinExpression(Map<String, Object> row, Expression expression) {
+        if (expression == null) {
+            return null;
+        }
+        if (expression instanceof IdentifierExpression identifier) {
+            return valueForIdentifier(row, identifier);
+        }
+        if (expression instanceof LiteralExpression literal) {
+            return literal.value == null ? null : literal.value.value;
+        }
+        if (expression instanceof UnaryExpression unary) {
+            Object value = valueForJoinExpression(row, unary.expression);
+            if (unary.operator.type == tokenType.NOT) {
+                return !truthy(value);
+            }
+            if (!(value instanceof Number number)) {
+                return value;
+            }
+            if (unary.operator.type == tokenType.SUB) {
+                return -number.doubleValue();
+            }
+            return value;
+        }
+        if (expression instanceof BinaryExpression binary) {
+            Object left = valueForJoinExpression(row, binary.left);
+            Object right = valueForJoinExpression(row, binary.right);
+            if (!(left instanceof Number leftNumber) || !(right instanceof Number rightNumber)) {
+                return null;
+            }
+            return switch (binary.operator.type) {
+                case PLUS -> leftNumber.doubleValue() + rightNumber.doubleValue();
+                case SUB -> leftNumber.doubleValue() - rightNumber.doubleValue();
+                case STAR -> leftNumber.doubleValue() * rightNumber.doubleValue();
+                case DIVIDE -> leftNumber.doubleValue() / rightNumber.doubleValue();
+                case MOD -> leftNumber.doubleValue() % rightNumber.doubleValue();
+                default -> null;
+            };
+        }
+        return null;
+    }
+
+    private boolean isNullLiteral(Expression expression) {
+        return expression instanceof LiteralExpression literal && literal.value != null && literal.value.value == null;
+    }
+
+    private boolean truthy(Object value) {
+        if (value instanceof Boolean bool) {
+            return bool;
+        }
+        if (value instanceof Number number) {
+            return number.doubleValue() != 0.0;
+        }
+        return value != null;
     }
 
     private void putInternalColumns(Map<String, Object> output, TableReference table, Map<String, Object> source) {

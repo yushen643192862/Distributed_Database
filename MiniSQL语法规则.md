@@ -367,30 +367,3 @@ RESHARD CLUSTER;
 ```sql
 REMOVE NODE dn5;
 ```
-
-## 完整可复制示例
-
-```sql
-CREATE TABLE readers (
-  id INT PRIMARY KEY,
-  reader_no CHAR(20),
-  name CHAR(50),
-  gender CHAR(10),
-  phone CHAR(20),
-  email CHAR(100),
-  registered_at CHAR(30)
-) SHARD BY HASH(id) SHARDS 2 REPLICAS 2;
-
-INSERT INTO readers VALUES
-  (1, 'R001', '张三', '男', '13800000000', 'zhangsan@test.com', '2026-05-20 18:10:00'),
-  (2, 'R002', '李四', '女', '13900000000', 'lisi@test.com', '2026-05-20 18:11:00'),
-  (3, 'R003', '王五', '男', '13700000000', 'wangwu@test.com', '2026-05-20 18:12:00');
-
-SELECT * FROM readers;
-SELECT id, name FROM readers WHERE gender = '男';
-UPDATE readers SET phone = '13600000000' WHERE id = 1;
-DELETE FROM readers WHERE id = 3;
-SHOW SHARDS readers;
-SHOW NODES;
-```
-

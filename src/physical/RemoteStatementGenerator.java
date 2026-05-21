@@ -201,6 +201,29 @@ public class RemoteStatementGenerator {
         }
         String result = sqlExpression(condition.left, type);
         if (condition.operator != null) {
+            if (condition.operator.type == tokenType.BETWEEN) {
+                if (condition.rightExpressions == null || condition.rightExpressions.size() != 2) {
+                    throw new IllegalArgumentException("BETWEEN needs lower and upper bounds");
+                }
+                return result + " BETWEEN " + sqlExpression(condition.rightExpressions.get(0), type)
+                        + " AND " + sqlExpression(condition.rightExpressions.get(1), type);
+            }
+            if (condition.operator.type == tokenType.IN) {
+                if (condition.rightExpressions == null || condition.rightExpressions.isEmpty()) {
+                    throw new IllegalArgumentException("IN needs at least one value");
+                }
+                List<String> values = new ArrayList<>();
+                for (Expression expression : condition.rightExpressions) {
+                    values.add(sqlExpression(expression, type));
+                }
+                return result + " IN (" + String.join(", ", values) + ")";
+            }
+            if (condition.operator.type == tokenType.IS) {
+                String not = condition.logicalOperator != null && condition.logicalOperator.type == tokenType.NOT
+                        ? " NOT"
+                        : "";
+                return result + " IS" + not + " " + sqlExpression(condition.right, type);
+            }
             result += " " + sqlOperator(condition.operator.type) + " " + sqlExpression(condition.right, type);
         }
         return result;

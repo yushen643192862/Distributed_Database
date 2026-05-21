@@ -303,38 +303,6 @@ SHOW CLUSTER;
 - 注册成功后 master 后台异步执行 repair/rebalance，避免 datanode 注册被慢数据库阻塞。
 - 表/分片路由元数据持久化；节点 endpoint 可由同名 datanode 重新注册覆盖。
 
-## 自动化测试
-
-设计报告功能测试：
-
-```powershell
-cd C:\Users\Lenovo\Desktop\big_infor_sys_build_tech\Distributed_Database
-powershell -ExecutionPolicy Bypass -File .\tests\run-design-report-tests.ps1
-```
-
-跳过故障切换：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tests\run-design-report-tests.ps1 -SkipFailover
-```
-
-重分片测试：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tests\run-reshard-test.ps1
-```
-
-观察并触发重分片：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tests\watch-reshard.ps1 -TableName reshard_user -ExpectedRows 50
-```
-
-清理测试状态：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tests\reset-test-state.ps1
-```
 
 ## 手动本地运行
 
@@ -390,66 +358,252 @@ java -cp "target\classes;target\dependency\*" minisql.datanode.DataNodeServer
 
 ## 可复制示例
 
+1. 创建表
+2.1 用户表 users
 ```sql
-CREATE TABLE readers (
-  id INT PRIMARY KEY,
-  reader_no CHAR(20),
-  name CHAR(50),
-  gender CHAR(10),
-  phone CHAR(20),
-  email CHAR(100),
-  registered_at CHAR(30)
-) SHARD BY HASH(id) SHARDS 2 REPLICAS 2;
-
-INSERT INTO readers VALUES
-  (1, 'R001', '张三', '男', '13800000001', 'zhangsan@test.com', '2025-01-10 10:00:00'),
-  (2, 'R002', '李四', '女', '13800000002', 'lisi@test.com', '2025-02-15 14:30:00'),
-  (3, 'R003', '王五', '男', '13800000003', 'wangwu@test.com', '2025-03-20 09:15:00');
-
-SELECT * FROM readers;
-SELECT * FROM readers ORDER BY registered_at DESC;
-SELECT * FROM readers LIMIT 2;
-SHOW SHARDS readers;
-SHOW NODES;
+CREATE TABLE users (
+    user_id INT PRIMARY KEY,
+    username CHAR(20),
+    age INT,
+    city CHAR(30),
+    email CHAR(50),
+    reg_date CHAR(30)
+) SHARD BY HASH(user_id) SHARDS 3 REPLICAS 2;
+```
+2.2 订单表 orders
+```sql
+CREATE TABLE orders (
+    order_id INT PRIMARY KEY,
+    user_id INT,
+    product CHAR(50),
+    quantity INT,
+    price FLOAT,
+    order_date CHAR(30)
+) SHARD BY HASH(order_id) SHARDS 3 REPLICAS 2;
 ```
 
-## 常见问题
+1. 插入数据（总计 70 条）
+3.1 users 表插入 20 条
+```sql
+INSERT INTO users VALUES
+  (1, 'Alice', 25, 'Beijing', 'alice@test.com', '2025-01-10 10:00:00'),
+  (2, 'Bob', 30, 'Shanghai', 'bob@test.com', '2025-01-11 11:00:00'),
+  (3, 'Carol', 28, 'Guangzhou', 'carol@test.com', '2025-01-12 12:00:00'),
+  (4, 'David', 35, 'Shenzhen', 'david@test.com', '2025-01-13 13:00:00'),
+  (5, 'Eve', 22, 'Beijing', 'eve@test.com', '2025-01-14 14:00:00'),
+  (6, 'Frank', 40, 'Shanghai', 'frank@test.com', '2025-01-15 15:00:00'),
+  (7, 'Grace', 27, 'Guangzhou', 'grace@test.com', '2025-01-16 16:00:00'),
+  (8, 'Henry', 33, 'Shenzhen', 'henry@test.com', '2025-01-17 17:00:00'),
+  (9, 'Ivy', 29, 'Beijing', 'ivy@test.com', '2025-01-18 18:00:00'),
+  (10, 'Jack', 31, 'Shanghai', 'jack@test.com', '2025-01-19 19:00:00'),
+  (11, 'Kevin', 26, 'Guangzhou', 'kevin@test.com', '2025-01-20 20:00:00'),
+  (12, 'Lisa', 24, 'Shenzhen', 'lisa@test.com', '2025-01-21 21:00:00'),
+  (13, 'Mike', 38, 'Beijing', 'mike@test.com', '2025-01-22 22:00:00'),
+  (14, 'Nina', 32, 'Shanghai', 'nina@test.com', '2025-01-23 23:00:00'),
+  (15, 'Oscar', 27, 'Guangzhou', 'oscar@test.com', '2025-01-24 10:00:00'),
+  (16, 'Paul', 29, 'Shenzhen', 'paul@test.com', '2025-01-25 11:00:00'),
+  (17, 'Quinn', 34, 'Beijing', 'quinn@test.com', '2025-01-26 12:00:00'),
+  (18, 'Rose', 23, 'Shanghai', 'rose@test.com', '2025-01-27 13:00:00'),
+  (19, 'Sam', 36, 'Guangzhou', 'sam@test.com', '2025-01-28 14:00:00'),
+  (20, 'Tina', 28, 'Shenzhen', 'tina@test.com', '2025-01-29 15:00:00');
+```
+3.2 orders 表插入 50 条
+```sql
+INSERT INTO orders VALUES
+  (101, 1, 'Laptop', 1, 5999.00, '2025-02-01 09:00:00'),
+  (102, 2, 'Mouse', 2, 89.50, '2025-02-01 10:00:00'),
+  (103, 3, 'Keyboard', 1, 199.00, '2025-02-02 11:00:00'),
+  (104, 4, 'Monitor', 1, 1299.00, '2025-02-02 12:00:00'),
+  (105, 5, 'USB Cable', 3, 25.00, '2025-02-03 13:00:00'),
+  (106, 6, 'Laptop', 1, 5999.00, '2025-02-03 14:00:00'),
+  (107, 7, 'Mouse', 1, 89.50, '2025-02-04 15:00:00'),
+  (108, 8, 'Keyboard', 2, 398.00, '2025-02-04 16:00:00'),
+  (109, 9, 'Monitor', 1, 1299.00, '2025-02-05 17:00:00'),
+  (110, 10, 'USB Cable', 5, 41.50, '2025-02-05 18:00:00'),
+  (111, 11, 'Laptop', 1, 5999.00, '2025-02-06 09:00:00'),
+  (112, 12, 'Mouse', 2, 179.00, '2025-02-06 10:00:00'),
+  (113, 13, 'Keyboard', 1, 199.00, '2025-02-07 11:00:00'),
+  (114, 14, 'Monitor', 2, 2598.00, '2025-02-07 12:00:00'),
+  (115, 15, 'USB Cable', 4, 33.20, '2025-02-08 13:00:00'),
+  (116, 16, 'Laptop', 1, 5999.00, '2025-02-08 14:00:00'),
+  (117, 17, 'Mouse', 1, 89.50, '2025-02-09 15:00:00'),
+  (118, 18, 'Keyboard', 1, 199.00, '2025-02-09 16:00:00'),
+  (119, 19, 'Monitor', 1, 1299.00, '2025-02-10 17:00:00'),
+  (120, 20, 'USB Cable', 6, 49.80, '2025-02-10 18:00:00'),
+  (121, 1, 'Headphones', 1, 299.00, '2025-02-11 10:00:00'),
+  (122, 2, 'Webcam', 1, 499.00, '2025-02-11 11:00:00'),
+  (123, 3, 'Desk Lamp', 1, 89.00, '2025-02-12 12:00:00'),
+  (124, 4, 'Laptop Stand', 2, 159.00, '2025-02-12 13:00:00'),
+  (125, 5, 'HDMI Cable', 2, 39.80, '2025-02-13 14:00:00'),
+  (126, 6, 'Headphones', 2, 598.00, '2025-02-13 15:00:00'),
+  (127, 7, 'Webcam', 1, 499.00, '2025-02-14 16:00:00'),
+  (128, 8, 'Desk Lamp', 2, 178.00, '2025-02-14 17:00:00'),
+  (129, 9, 'Laptop Stand', 1, 79.50, '2025-02-15 09:00:00'),
+  (130, 10, 'HDMI Cable', 3, 59.70, '2025-02-15 10:00:00'),
+  (131, 11, 'Laptop', 1, 5999.00, '2025-02-16 11:00:00'),
+  (132, 12, 'Mouse', 1, 89.50, '2025-02-16 12:00:00'),
+  (133, 13, 'Keyboard', 1, 199.00, '2025-02-17 13:00:00'),
+  (134, 14, 'Monitor', 1, 1299.00, '2025-02-17 14:00:00'),
+  (135, 15, 'USB Cable', 2, 16.60, '2025-02-18 15:00:00'),
+  (136, 16, 'Headphones', 1, 299.00, '2025-02-18 16:00:00'),
+  (137, 17, 'Webcam', 2, 998.00, '2025-02-19 17:00:00'),
+  (138, 18, 'Desk Lamp', 1, 89.00, '2025-02-19 18:00:00'),
+  (139, 19, 'Laptop Stand', 2, 159.00, '2025-02-20 09:00:00'),
+  (140, 20, 'HDMI Cable', 4, 79.60, '2025-02-20 10:00:00'),
+  (141, 1, 'Laptop', 1, 5999.00, '2025-02-21 11:00:00'),
+  (142, 2, 'Mouse', 2, 179.00, '2025-02-21 12:00:00'),
+  (143, 3, 'Keyboard', 1, 199.00, '2025-02-22 13:00:00'),
+  (144, 4, 'Monitor', 1, 1299.00, '2025-02-22 14:00:00'),
+  (145, 5, 'USB Cable', 5, 41.50, '2025-02-23 15:00:00'),
+  (146, 6, 'Headphones', 2, 598.00, '2025-02-23 16:00:00'),
+  (147, 7, 'Webcam', 1, 499.00, '2025-02-24 17:00:00'),
+  (148, 8, 'Desk Lamp', 2, 178.00, '2025-02-24 18:00:00'),
+  (149, 9, 'Laptop Stand', 1, 79.50, '2025-02-25 09:00:00'),
+  (150, 10, 'HDMI Cable', 3, 59.70, '2025-02-25 10:00:00');
+```
+4. 查询测试
+4.1 简单全表查询  注意：不支持--注释
+```sql
+SELECT * FROM users;
+SELECT * FROM orders;
+```
+4.2 投影与条件
+```sql
+-- 指定列
+SELECT user_id, username, city FROM users;
 
-Docker 拉镜像失败：
+-- 按分片键查询
+SELECT * FROM users WHERE user_id = 5;
+SELECT * FROM orders WHERE order_id = 130;
 
-```powershell
-docker pull nginx:1.27-alpine
-docker pull node:22-alpine
-docker pull mysql:8.4
-docker pull postgres:16
-docker pull maven:3.9-eclipse-temurin-17
-docker pull eclipse-temurin:17-jre
+-- 按非分片键查询
+SELECT username, age FROM users WHERE city = 'Beijing';
+SELECT order_id, product, quantity FROM orders WHERE product = 'Laptop';
+```
+4.3 比较运算符
+```sql
+SELECT * FROM users WHERE age > 30;
+SELECT * FROM orders WHERE price <= 100;
+SELECT * FROM users WHERE city <> 'Shanghai';
+```
+4.4 逻辑组合
+```sql
+SELECT * FROM users WHERE age BETWEEN 25 AND 35 AND city = 'Guangzhou';
+SELECT * FROM orders WHERE product = 'Mouse' OR product = 'Keyboard';
+SELECT * FROM users WHERE NOT city = 'Beijing';
+```
+4.5 排序与限制
+```sql
+-- ORDER BY（分布式下可能未完全优化，但语法通过）
+SELECT * FROM users ORDER BY age DESC LIMIT 5;
+SELECT * FROM orders ORDER BY price ASC LIMIT 10;
+```
+4.6 聚合与分组
+```sql
+SELECT city, COUNT(*) AS user_count FROM users GROUP BY city;
+SELECT product, SUM(quantity) AS total_sold FROM orders GROUP BY product;
+SELECT city, AVG(age) FROM users GROUP BY city HAVING AVG(age) > 30;
+```
+4.7 JOIN 测试（等值内连接）
+```sql
+-- 查询每个订单对应的用户名和产品
+SELECT u.username, o.product, o.quantity, o.price
+FROM users u JOIN orders o ON u.user_id = o.user_id
+LIMIT 20;
+
+-- 带条件过滤的 JOIN
+SELECT u.username, u.city, o.order_id, o.order_date
+FROM users u JOIN orders o ON u.user_id = o.user_id
+WHERE u.city = 'Shanghai' AND o.price > 200;
+```
+4.8 随机数函数
+```sql
+-- 创建临时测试表
+CREATE TABLE rand_test (
+    id INT PRIMARY KEY,
+    val FLOAT
+) SHARD BY HASH(id) SHARDS 1 REPLICAS 1;
+
+INSERT INTO rand_test VALUES (1, RAND());
+INSERT INTO rand_test VALUES (2, RANDOM());
+SELECT * FROM rand_test;
+```
+5. 更新测试
+5.1 使用分片键更新
+```sql
+UPDATE users SET email = 'alice_new@test.com' WHERE user_id = 1;
+UPDATE orders SET quantity = 2, price = 1199.00 WHERE order_id = 104;
+```
+5.2 使用非分片键更新
+```sql
+UPDATE users SET city = 'Beijing' WHERE username = 'Bob';
+UPDATE orders SET product = 'Gaming Mouse' WHERE product = 'Mouse' AND price = 89.50;
+```
+5.3 多列更新
+```sql
+UPDATE users SET age = 26, city = 'Chengdu' WHERE user_id = 11;
+```
+6. 删除测试
+6.1 按分片键删除
+```sql
+DELETE FROM users WHERE user_id = 20;
+DELETE FROM orders WHERE order_id = 150;
+```
+6.2 按非分片键删除
+```sql
+DELETE FROM users WHERE city = 'Shenzhen' AND age < 25;
+DELETE FROM orders WHERE product = 'USB Cable' AND quantity > 4;
+注意：删除后可使用 SELECT 验证数据变化。
 ```
 
-如果 Docker Hub 网络不通，在 Docker Desktop 里设置代理：
+7. 索引测试
+```sql
+-- 创建普通索引
+CREATE INDEX idx_users_city ON users (city);
+CREATE INDEX idx_orders_product ON orders (product);
 
-```text
-Settings -> Resources -> Proxies
-HTTP proxy:  http://127.0.0.1:7897
-HTTPS proxy: http://127.0.0.1:7897
+-- 创建唯一索引
+CREATE UNIQUE INDEX idx_users_email ON users (email);
+
+-- 查看索引（所有表）
+SHOW INDEXES;
+
+-- 查看特定表的索引
+SHOW INDEXES users;
+SHOW INDEXES orders;
+
+-- 删除索引
+DROP INDEX idx_users_city;
+DROP INDEX idx_orders_product;
+DROP INDEX idx_users_email;
+```
+8. 集群状态查看命令
+```sql
+SHOW NODES;          -- 查看所有 datanode
+SHOW SHARDS;         -- 查看全部逻辑分片
+SHOW SHARDS users;   -- 查看 users 表的分片分布
+SHOW SHARDS orders;  -- 查看 orders 表的分片分布
+SHOW CLUSTER;        -- 完整集群状态
+SHOW TABLES;         -- 查看底层物理表（包含系统生成的物理表）
 ```
 
-页面结果仍是旧版本：
+## 初始化脚本
+```bash
+启动全部节点：
+docker compose build
+docker compose up -d
 
-```text
-Ctrl + F5
-```
+如果不启动全部节点：
+docker compose build
+docker compose up -d master web mysql1 mysql2 mysql3 mysql4 mysql5 postgres1 postgres2 postgres3 postgres4 postgres5
+docker compose up -d dn1 dn2 dn3 dn4 ...
+最大到dn10
 
-代码改了但 Docker 里没生效：
+停止某个节点：
+docker compose stop dn5
+启动某个停止了的节点
+docker compose start dn5
 
-```powershell
-docker compose up --build master
-docker compose up --build web
-```
-
-彻底清空测试数据：
-
-```powershell
-docker compose down -v
-docker compose up --build
+前端网址是：
+http://127.0.0.1:5173
 ```
